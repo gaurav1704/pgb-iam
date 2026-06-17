@@ -40,20 +40,35 @@ This is fragile, operationally expensive, and undermines the security benefits o
 | Config file (TOML) | ✅ Phase 1 |
 | Prometheus metrics | ✅ Phase 1 |
 | Health check endpoint | ✅ Phase 1 |
-| AWS RDS IAM token generation | 🔧 Phase 2 |
-| GCP Cloud SQL IAM auth | 🔧 Phase 2 |
-| Transparent auth injection | 🔧 Phase 2 |
-| Automatic token refresh | 🔧 Phase 2 |
+| PostgreSQL wire protocol parser | ✅ Phase 2 |
+| AWS RDS IAM token generation | ✅ Phase 2 |
+| Transparent auth injection (cleartext + MD5) | ✅ Phase 2 |
+| Token cache with auto-refresh | ✅ Phase 2 |
+| GCP Cloud SQL IAM auth | 🔧 Phase 2 (stub) |
 | TLS support | 📋 Phase 3 |
 
 ### How IAM Auth Works
 
 1. Client connects to pgb-iam with their database username
-2. pgb-iam detects that IAM auth is configured for this user
-3. pgb-iam generates a fresh IAM token via the cloud provider's SDK
-4. pgb-iam uses the token as the password when connecting to PostgreSQL
-5. Token is cached and automatically refreshed before expiry (~15 min for AWS)
-6. Client never sees or manages tokens — it "just works"
+2. pgb-iam reads the PostgreSQL startup packet, extracts the username
+3. pgb-iam connects to the backend (RDS/Cloud SQL) and forwards the startup
+4. When the backend requests a password, pgb-iam generates a fresh IAM token via the cloud provider's SDK
+5. The token is sent as the password (cleartext or MD5-hashed, matching the backend's auth method)
+6. Token is cached and automatically refreshed before expiry (~15 min for AWS, refreshed every 10 min)
+7. After authentication, all traffic is relayed transparently — clients don't know IAM is involved
+
+### Wire Protocol Flow
+
+```
+Client          pgb-iam           Backend (RDS)
+  │                │                  │
+  │── Startup ────▶│── Startup ──────▶│
+  │                │◀─ AuthReq(R) ────│
+  │                │── Password(p) ──▶│  ← IAM token injected here
+  │                │◀─ AuthOk ────────│
+  │◀─ AuthOk ──────│                  │
+  │══════ relay ═══▶══════ relay ════▶│
+```
 
 ### Why Rust
 
@@ -85,9 +100,39 @@ src/
 ├── main.rs          # Entry point, config loading, runtime setup
 ├── config/          # TOML config deserialization
 ├── pool/            # Connection pool (idle reaper, max size enforcement)
-├── proxy/           # TCP relay (copy_bidirectional)
-├── auth/            # IAM token providers (AWS, GCP)
+├── proxy/           # TCP relay + IAM auth injection
+├── pgproto/         # PostgreSQL wire protocol parser (startup, auth messages)
+├── auth/            # IAM token providers + token cache with auto-refresh
 └── metrics/         # Prometheus + health endpoint
+```
+
+### Configuration
+
+```toml
+[listen]
+addr = "127.0.0.1"
+port = 6432
+
+[pool]
+min_size = 2
+max_size = 10
+idle_timeout_secs = 300
+target_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
+target_port = 5432
+dbname = "postgres"
+db_user = "postgres"
+
+[metrics]
+enabled = true
+listen_addr = "127.0.0.1"
+listen_port = 9090
+
+[iam]
+provider = "Aws"              # Aws | Gcp | None
+region = "us-east-1"
+instance_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
+instance_port = 5432
+db_user = "iam_user"          # Which database user uses IAM auth
 ```
 
 ## License
