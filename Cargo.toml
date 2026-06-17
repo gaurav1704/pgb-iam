@@ -20,3 +20,12 @@ md-5 = "0.10"
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+rand = "0.8"
+base64 = "0.22"
+ldap3 = { version = "0.11", features = ["tls"] }
+# pam = "0.8"  Using custom FFI in auth/pam_ffi.rs
+ipnetwork = "0.20"
+libc = "0.2"

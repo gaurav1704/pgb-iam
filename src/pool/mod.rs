@@ -59,6 +59,20 @@ impl AsyncWrite for ServerStream {
     }
 }
 
+impl ServerStream {
+    /// Returns peer certificates if this is a TLS connection.
+    #[allow(dead_code)]
+    pub fn peer_certificates(&self) -> Option<Vec<rustls::pki_types::CertificateDer<'static>>> {
+        match self {
+            ServerStream::Plain(_) => None,
+            ServerStream::Tls(tls) => {
+                let (_, session) = tls.get_ref();
+                session.peer_certificates().map(|c| c.to_vec())
+            }
+        }
+    }
+}
+
 /// Key that identifies a unique connection pool (per backend+database+db_user).
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub struct PoolKey {

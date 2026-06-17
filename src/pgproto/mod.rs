@@ -122,11 +122,23 @@ pub async fn write_startup_message(
     let mut buf = Vec::new();
     buf.extend_from_slice(&PROTOCOL_VERSION_3.to_be_bytes());
 
+    // Always write user and database
+    buf.extend_from_slice(b"user");
+    buf.push(0);
+    buf.extend_from_slice(params.user.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(b"database");
+    buf.push(0);
+    buf.extend_from_slice(params.database.as_bytes());
+    buf.push(0);
+
     for (key, value) in &params.params {
-        buf.extend_from_slice(key.as_bytes());
-        buf.push(0);
-        buf.extend_from_slice(value.as_bytes());
-        buf.push(0);
+        if key != "user" && key != "database" {
+            buf.extend_from_slice(key.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(value.as_bytes());
+            buf.push(0);
+        }
     }
     buf.push(0);
 

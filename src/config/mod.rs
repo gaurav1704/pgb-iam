@@ -84,6 +84,16 @@ pub struct ClientAuthConfig {
     #[serde(rename = "type")]
     pub auth_type: ClientAuthType,
     pub password: Option<String>,
+    #[serde(default)]
+    pub auth_query: Option<AuthQueryConfig>,
+    #[serde(default)]
+    pub pam_service: Option<String>,
+    #[serde(default)]
+    pub ldap: Option<LdapAuthConfig>,
+    #[serde(default)]
+    pub hba_rules: Vec<HbaRuleConfig>,
+    #[serde(default)]
+    pub client_ca: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -91,6 +101,37 @@ pub struct ClientAuthConfig {
 pub enum ClientAuthType {
     Trust,
     Password,
+    ScramSha256,
+    Cert,
+    Pam,
+    Ldap,
+    Hba,
+    AuthQuery,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AuthQueryConfig {
+    pub user: String,
+    pub query: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LdapAuthConfig {
+    pub uri: String,
+    pub bind_dn: String,
+    pub bind_password: String,
+    pub search_base: String,
+    pub search_filter: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HbaRuleConfig {
+    #[serde(rename = "type")]
+    pub conn_type: String,
+    pub database: Vec<String>,
+    pub user: Vec<String>,
+    pub address: Option<String>,
+    pub auth: String, // trust, password, scram-sha-256, cert, pam, ldap, reject
 }
 
 #[derive(Debug, Deserialize, Clone)]

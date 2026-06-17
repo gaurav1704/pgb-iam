@@ -1,52 +1,149 @@
+# pgb-iam — PostgreSQL Connection Pooler with IAM Auth
+# =====================================================
+# This config shows ALL supported auth methods.
+# Uncomment/comment the [client_auth] section to select your auth method.
+# You must remove the AWS IAM region in the comments.
+#   Only one [client_auth] block should be active at a time
+#   (unless using hba, which dispatches per-connection).
+
 [listen]
 addr = "127.0.0.1"
 port = 6432
 
 [pool]
-mode = "session"
-strategy = "lifo"
+mode = "session"          # "session" | "transaction"
+strategy = "lifo"         # "lifo" | "fifo"
 max_size = 10
-min_size = 2
-reserve_size = 2
+min_size = 2              # background warm-up connections
+reserve_size = 2          # extra headroom beyond max_size
 idle_timeout_secs = 300
 target_host = "localhost"
 target_port = 5432
 dbname = "postgres"
-db_user = "postgres"
+db_user = "postgres"      # the user pgb-iam connects AS to PostgreSQL
+server_reset_query = "DISCARD ALL"
 
+# Per-database and per-user pool limits
 [pool.database_limits]
-"postgres" = { max_size = 20, min_size = 1 }
+"postgres" = { max_size = 20, min_size = 1, reserve_size = 3 }
+"myapp" = { max_size = 50 }
 
 [pool.user_limits]
 "admin" = { max_size = 15 }
+"readonly" = { max_size = 5 }
 
-[client_auth]
-type = "trust"
+# ── Auth method 1: trust (no password) ────────────────────────────────
+#[client_auth]
+#type = "trust"
 
+# ── Auth method 2: password (cleartext) ───────────────────────────────
+#[client_auth]
+#type = "password"
+#password = "mysecret"
+
+# ── Auth method 3: password with auth_query (lookup from DB) ──────────
+#[client_auth]
+#type = "password"
+#[client_auth.auth_query]
+#user = "pgb_iam_auth"           # auth_query connect user
+#query = "SELECT passwd FROM pg_shadow WHERE usename = $1"
+
+# ── Auth method 4: SCRAM-SHA-256 ──────────────────────────────────────
+#[client_auth]
+#type = "scram-sha-256"
+#password = "mysecret"
+# Or with auth_query:
+#[client_auth.auth_query]
+#user = "pgb_iam_auth"
+#query = "SELECT passwd FROM pg_shadow WHERE usename = $1"
+
+# ── Auth method 5: TLS client certificate ─────────────────────────────
+# Requires [tls] enabled AND client_ca set.
+#[client_auth]
+#type = "cert"
+#client_ca = "/path/to/client-ca.pem"
+#[tls]
+#enabled = true
+#cert_path = "server.crt"
+#key_path = "server.key"
+#connect_with_tls = false
+
+# ── Auth method 6: PAM ────────────────────────────────────────────────
+#[client_auth]
+#type = "pam"
+#pam_service = "pgb-iam"              # default: "pgb-iam"
+
+# ── Auth method 7: LDAP ───────────────────────────────────────────────
+#[client_auth]
+#type = "ldap"
+#[client_auth.ldap]
+#uri = "ldap://ldap.example.com"
+#bind_dn = "cn=admin,dc=example,dc=com"
+#bind_password = "admin_secret"
+#search_base = "dc=example,dc=com"
+#search_filter = "(uid=$1)"           # $1 replaced with login user
+
+# ── Auth method 8: HBA (pg_hba.conf-style rules) ──────────────────────
+# When hba_rules is non-empty, rules are tested in order.
+# The first match determines the auth method for that connection.
+#[client_auth]
+#type = "hba"  # or "password", "scram-sha-256", etc. as fallback
+#password = "mysecret"
+#client_ca = "/path/to/client-ca.pem"  # needed for cert auth in HBA
+## Optional: PAM, LDAP, auth_query sub-configs used by HBA rules
+## that dispatch to pam/ldap/password methods.
+#
+#[[client_auth.hba_rules]]
+#type = "hostssl"
+#database = ["all"]
+#user = ["all"]
+#address = "0.0.0.0/0"
+#auth = "cert"
+#
+#[[client_auth.hba_rules]]
+#type = "host"
+#database = ["mydb", "postgres"]
+#user = ["admin"]
+#address = "10.0.0.0/8"
+#auth = "scram-sha-256"
+#
+#[[client_auth.hba_rules]]
+#type = "hostnossl"
+#database = ["all"]
+#user = ["all"]
+#address = "127.0.0.1/32"
+#auth = "trust"
+
+# ── IAM (optional) — authenticates pgb-iam → PostgreSQL backends ──────
+[iam]
+provider = "aws"              # "aws" | "gcp" | "none"
+region = "us-east-1"
+instance_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
+instance_port = 5432
+db_user = "iam_user"          # the IAM user for backend connections
+# Note: pool.db_user (above) must match this for IAM auth to trigger.
+
+# ── Metrics (Prometheus) ──────────────────────────────────────────────
 [metrics]
 enabled = true
 listen_addr = "127.0.0.1"
 listen_port = 9090
 
+# ── Admin HTTP API ────────────────────────────────────────────────────
 [admin]
 enabled = true
 listen_addr = "127.0.0.1"
 listen_port = 9091
 
+# ── Health check ──────────────────────────────────────────────────────
 [health_check]
 enabled = true
 interval_secs = 30
 timeout_secs = 5
 
+# ── TLS ───────────────────────────────────────────────────────────────
 [tls]
 enabled = false
 cert_path = "server.crt"
 key_path = "server.key"
-connect_with_tls = false
-
-[iam]
-provider = "aws"
-region = "us-east-1"
-instance_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
-instance_port = 5432
-db_user = "iam_user"
+connect_with_tls = false       # connect to PostgreSQL with TLS?

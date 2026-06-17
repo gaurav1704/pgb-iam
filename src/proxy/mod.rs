@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod health;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -31,7 +32,7 @@ pub async fn run(
 
         tokio::spawn(async move {
             tracing::debug!("new client connection from {}", peer);
-            if let Err(e) = handle_client(inbound, &config, pool, token_cache.as_ref()).await {
+            if let Err(e) = handle_client(inbound, peer, &config, pool, token_cache.as_ref()).await {
                 tracing::error!("handler error for {}: {}", peer, e);
             }
             tracing::debug!("client {} disconnected", peer);
@@ -45,12 +46,14 @@ type ClientStream = ServerStream;
 
 async fn handle_client(
     raw_client: TcpStream,
+    peer: SocketAddr,
     config: &Config,
     pool: Arc<PoolManager>,
     token_cache: Option<&Arc<TokenCache>>,
 ) -> anyhow::Result<()> {
-    // 1. Client TLS upgrade
+    // 1. Client TLS upgrade (with optional client cert request)
     let mut client = upgrade_client_tls(raw_client, config).await?;
+    let client_cert_present = client_cert_was_present(&client);
 
     // 2. Read startup from client
     let startup = read_client_startup(&mut client).await?;
@@ -60,7 +63,14 @@ async fn handle_client(
     );
 
     // 3. Authenticate client locally
-    authenticate_client(&mut client, config).await?;
+    authenticate_client(
+        &mut client,
+        config,
+        &startup.user,
+        peer.ip(),
+        client_cert_present,
+    )
+    .await?;
 
     // 4. Pool key uses BACKEND credentials
     let pool_key = PoolKey {
@@ -122,17 +132,29 @@ async fn upgrade_client_tls(
         return Ok(ClientStream::Plain(stream));
     }
     let tls_config = config.tls.as_ref().unwrap();
+    let client_ca = config.client_auth.client_ca.as_deref();
     let initial = pgproto::read_initial_message(&mut stream).await?;
     match initial {
         pgproto::InitialMessage::SslRequest => {
             pgproto::send_ssl_accept(&mut stream).await?;
             let tls_stream =
-                tls::tls_accept(stream, &tls_config.cert_path, &tls_config.key_path).await?;
+                tls::tls_accept(stream, &tls_config.cert_path, &tls_config.key_path, client_ca).await?;
             Ok(ClientStream::Tls(tls_stream))
         }
         pgproto::InitialMessage::Startup(_) => {
             anyhow::bail!("client sent startup without SSLRequest, but TLS is required");
         }
+    }
+}
+
+/// Check if the TLS session has a verified client certificate.
+fn client_cert_was_present(client: &ClientStream) -> bool {
+    match client {
+        ClientStream::Tls(tls_stream) => {
+            let (_, session) = tls_stream.get_ref();
+            session.peer_certificates().is_some_and(|c| !c.is_empty())
+        }
+        _ => false,
     }
 }
 
@@ -151,42 +173,271 @@ async fn read_client_startup(client: &mut ClientStream) -> anyhow::Result<pgprot
 async fn authenticate_client(
     client: &mut ClientStream,
     config: &Config,
+    user: &str,
+    client_ip: std::net::IpAddr,
+    client_cert: bool,
 ) -> anyhow::Result<()> {
-    match config.client_auth.auth_type {
+    let auth = &config.client_auth;
+    let tls_on = matches!(client, ClientStream::Tls(_));
+
+    // HBA: if rules are configured, iterate to find first match.
+    if !auth.hba_rules.is_empty() {
+        for hba_cfg in &auth.hba_rules {
+            let conn_types = if tls_on { vec!["hostssl", "host"] } else { vec!["hostnossl", "host"] };
+            let ct_match = conn_types.iter().any(|ct| *ct == hba_cfg.conn_type);
+            if !ct_match { continue; }
+            let db_match = hba_cfg.database.iter().any(|d| d == "all" || d == user || (d == "sameuser" && user == user));
+            if !db_match { continue; }
+            if !hba_cfg.user.iter().any(|u| u == "all" || u == user) { continue; }
+            if let Some(ref addr_str) = hba_cfg.address {
+                if let Ok(net) = addr_str.parse::<ipnetwork::IpNetwork>() {
+                    if !net.contains(client_ip) { continue; }
+                }
+            }
+            return hba_dispatch(client, config, &hba_cfg.auth, user, client_ip, client_cert, tls_on).await;
+        }
+        let err = pgproto::build_error_response("28P01", "no pg_hba.conf entry for connection");
+        client.write_all(&err).await?;
+        client.flush().await?;
+        anyhow::bail!("no matching HBA rule for user {}", user);
+    }
+
+    auth_dispatch(client, config, &auth.auth_type, user, client_ip, client_cert).await
+}
+
+async fn hba_dispatch(
+    client: &mut ClientStream,
+    config: &Config,
+    method: &str,
+    user: &str,
+    client_ip: std::net::IpAddr,
+    client_cert: bool,
+    _tls_on: bool,
+) -> anyhow::Result<()> {
+    match method {
+        "trust" => {
+            pgproto::write_raw_message(client, b'R', &0i32.to_be_bytes()).await?;
+            client.flush().await?;
+            Ok(())
+        }
+        "reject" => {
+            let err = pgproto::build_error_response("28P01", "pg_hba rejects connection");
+            client.write_all(&err).await?;
+            client.flush().await?;
+            anyhow::bail!("connection rejected by pg_hba.conf")
+        }
+        "password" => auth_dispatch(client, config, &ClientAuthType::Password, user, client_ip, client_cert).await,
+        "scram-sha-256" => auth_dispatch(client, config, &ClientAuthType::ScramSha256, user, client_ip, client_cert).await,
+        "cert" => auth_dispatch(client, config, &ClientAuthType::Cert, user, client_ip, client_cert).await,
+        "pam" => auth_dispatch(client, config, &ClientAuthType::Pam, user, client_ip, client_cert).await,
+        "ldap" => auth_dispatch(client, config, &ClientAuthType::Ldap, user, client_ip, client_cert).await,
+        other => {
+            let err = pgproto::build_error_response("28P01", &format!("unknown HBA auth method: {other}"));
+            client.write_all(&err).await?;
+            client.flush().await?;
+            anyhow::bail!("unknown HBA auth method: {other}")
+        }
+    }
+}
+
+async fn auth_dispatch(
+    client: &mut ClientStream,
+    config: &Config,
+    auth_type: &ClientAuthType,
+    user: &str,
+    _client_ip: std::net::IpAddr,
+    client_cert: bool,
+) -> anyhow::Result<()> {
+    let auth = &config.client_auth;
+    let target = config.target_addr();
+
+    match *auth_type {
         ClientAuthType::Trust => {
             pgproto::write_raw_message(client, b'R', &0i32.to_be_bytes()).await?;
             client.flush().await?;
             Ok(())
         }
         ClientAuthType::Password => {
-            // Request cleartext password
             pgproto::write_raw_message(client, b'R', &3i32.to_be_bytes()).await?;
             client.flush().await?;
-
-            match pgproto::read_pg_message(client).await? {
-                None => anyhow::bail!("client closed during auth"),
-                Some((type_byte, pwd_payload)) => {
-                    if type_byte != b'p' {
-                        anyhow::bail!("expected PasswordMessage (p), got {}", type_byte as char);
-                    }
-                    // Strip trailing NUL
-                    let password = String::from_utf8_lossy(
-                        &pwd_payload[..pwd_payload.len().saturating_sub(1)],
-                    )
-                    .to_string();
-                    let expected = config.client_auth.password.as_deref().unwrap_or("");
-                    if password != expected {
-                        let err = pgproto::build_error_response("28P01", "password authentication failed");
-                        client.write_all(&err).await?;
-                        client.flush().await?;
-                        anyhow::bail!("client password authentication failed");
-                    }
+            let password = read_password_message(client).await?;
+            match check_password(&password, user, auth, &target).await {
+                Ok(()) => {
                     pgproto::write_raw_message(client, b'R', &0i32.to_be_bytes()).await?;
                     client.flush().await?;
                     Ok(())
                 }
+                Err(e) => {
+                    let err = pgproto::build_error_response("28P01", &format!("password authentication failed: {e}"));
+                    client.write_all(&err).await?;
+                    client.flush().await?;
+                    Err(e)
+                }
             }
         }
+        ClientAuthType::ScramSha256 => {
+            let password = if let Some(ref pwd) = auth.password {
+                pwd.clone()
+            } else if let Some(ref aq) = auth.auth_query {
+                crate::auth::auth_query::lookup_password(&target, &aq.user, &aq.query, user).await?
+            } else {
+                anyhow::bail!("no password source for SCRAM auth")
+            };
+            do_scram_server_auth(client, &password).await
+        }
+        ClientAuthType::Cert => {
+            if !client_cert {
+                let err = pgproto::build_error_response("28P01", "certificate authentication failed");
+                client.write_all(&err).await?;
+                client.flush().await?;
+                anyhow::bail!("cert auth requires TLS client certificate");
+            }
+            pgproto::write_raw_message(client, b'R', &0i32.to_be_bytes()).await?;
+            client.flush().await?;
+            Ok(())
+        }
+        ClientAuthType::Pam => {
+            pgproto::write_raw_message(client, b'R', &3i32.to_be_bytes()).await?;
+            client.flush().await?;
+            let password = read_password_message(client).await?;
+            let service = auth.pam_service.as_deref().unwrap_or("pgb-iam");
+            if let Err(e) = crate::auth::pam::authenticate(service, user, &password) {
+                let err = pgproto::build_error_response("28P01", &format!("pam authentication failed: {e}"));
+                client.write_all(&err).await?;
+                client.flush().await?;
+                return Err(e.into());
+            }
+            pgproto::write_raw_message(client, b'R', &0i32.to_be_bytes()).await?;
+            client.flush().await?;
+            Ok(())
+        }
+        ClientAuthType::Ldap => {
+            pgproto::write_raw_message(client, b'R', &3i32.to_be_bytes()).await?;
+            client.flush().await?;
+            let password = read_password_message(client).await?;
+            let ldap_cfg = auth.ldap.as_ref().ok_or_else(|| anyhow::anyhow!("LDAP not configured"))?;
+            let cfg = crate::auth::ldap::LdapConfig {
+                uri: ldap_cfg.uri.clone(),
+                bind_dn: ldap_cfg.bind_dn.clone(),
+                bind_password: ldap_cfg.bind_password.clone(),
+                search_base: ldap_cfg.search_base.clone(),
+                search_filter: ldap_cfg.search_filter.clone(),
+            };
+            if let Err(e) = crate::auth::ldap::authenticate(&cfg, user, &password).await {
+                let err = pgproto::build_error_response("28P01", &format!("ldap authentication failed: {e}"));
+                client.write_all(&err).await?;
+                client.flush().await?;
+                return Err(e.into());
+            }
+            pgproto::write_raw_message(client, b'R', &0i32.to_be_bytes()).await?;
+            client.flush().await?;
+            Ok(())
+        }
+        ClientAuthType::Hba | ClientAuthType::AuthQuery => {
+            anyhow::bail!("auth type {:?} requires HBA rules or password source", auth_type)
+        }
+    }
+}
+
+async fn check_password(
+    password: &str,
+    user: &str,
+    auth: &crate::config::ClientAuthConfig,
+    target: &str,
+) -> anyhow::Result<()> {
+    // Try local password
+    if let Some(ref expected) = auth.password {
+        if password == expected {
+            return Ok(());
+        }
+        anyhow::bail!("password mismatch")
+    }
+    // Try auth_query
+    if let Some(ref aq) = auth.auth_query {
+        let server_pwd = crate::auth::auth_query::lookup_password(target, &aq.user, &aq.query, user).await?;
+        if password == server_pwd {
+            return Ok(());
+        }
+        anyhow::bail!("password mismatch (auth_query)")
+    }
+    anyhow::bail!("no password source configured")
+}
+
+async fn read_password_message(client: &mut ClientStream) -> anyhow::Result<String> {
+    match pgproto::read_pg_message(client).await? {
+        None => anyhow::bail!("client closed during auth"),
+        Some((type_byte, payload)) => {
+            if type_byte != b'p' {
+                anyhow::bail!("expected PasswordMessage (p), got {}", type_byte as char);
+            }
+            Ok(String::from_utf8_lossy(&payload[..payload.len().saturating_sub(1)]).to_string())
+        }
+    }
+}
+
+/// Server-side SCRAM-SHA-256 SASL exchange for client auth.
+async fn do_scram_server_auth(
+    client: &mut ClientStream,
+    password: &str,
+) -> anyhow::Result<()> {
+    use crate::auth::scram::ScramServer;
+
+    // Send AuthenticationSASL with SCRAM-SHA-256
+    let mut payload = vec![0u8; 4 + 13]; // int32(10) + "SCRAM-SHA-256\0"
+    payload[..4].copy_from_slice(&10i32.to_be_bytes());
+    payload[4..].copy_from_slice(b"SCRAM-SHA-256\0");
+    pgproto::write_raw_message(client, b'R', &payload).await?;
+    client.flush().await?;
+
+    let mut server = ScramServer::new(password);
+
+    // Read client-first-message (SASLInitialResponse)
+    match pgproto::read_pg_message(client).await? {
+        None => anyhow::bail!("client closed during SASL auth"),
+        Some((b'p', data)) => {
+            // payload: name\0 client-first-message
+            let sasl_mech_end = data.iter().position(|&b| b == 0).unwrap_or(0);
+            let client_first = String::from_utf8_lossy(&data[sasl_mech_end + 1..]).to_string();
+            let server_first = server.build_server_first(&client_first)?;
+
+            // Send AuthenticationSASLContinue
+            let mut cont_payload = vec![0u8; 4 + server_first.len() + 1]; // int32(11) + data + \0
+            cont_payload[..4].copy_from_slice(&11i32.to_be_bytes());
+            cont_payload[4..4 + server_first.len()].copy_from_slice(server_first.as_bytes());
+            pgproto::write_raw_message(client, b'R', &cont_payload).await?;
+            client.flush().await?;
+        }
+        Some((t, _)) => anyhow::bail!("expected SASLInitialResponse, got {}", t as char),
+    }
+
+    // Read client-final-message
+    match pgproto::read_pg_message(client).await? {
+        None => anyhow::bail!("client closed during SASL auth"),
+        Some((b'p', data)) => {
+            let client_final = String::from_utf8_lossy(&data).to_string();
+
+            match server.handle_client_final(&client_final) {
+                Ok(server_final) => {
+                    // Send AuthenticationSASLFinal (12)
+                    let mut final_payload = vec![0u8; 4 + server_final.len() + 1];
+                    final_payload[..4].copy_from_slice(&12i32.to_be_bytes());
+                    final_payload[4..4 + server_final.len()].copy_from_slice(server_final.as_bytes());
+                    pgproto::write_raw_message(client, b'R', &final_payload).await?;
+
+                    // Send AuthenticationOk
+                    pgproto::write_raw_message(client, b'R', &0i32.to_be_bytes()).await?;
+                    client.flush().await?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let err = pgproto::build_error_response("28P01", &format!("SASL auth failed: {}", e));
+                    client.write_all(&err).await?;
+                    client.flush().await?;
+                    Err(e)
+                }
+            }
+        }
+        Some((t, _)) => anyhow::bail!("expected SASLResponse, got {}", t as char),
     }
 }
 
@@ -242,7 +493,7 @@ async fn create_backend(
     let backend_startup = pgproto::StartupParams {
         user: pool_key.db_user.clone(),
         database: pool_key.dbname.clone(),
-        params: Vec::new(), // minimal — extra params from client aren't needed
+        params: Vec::new(),
     };
     pgproto::write_startup_message(&mut backend, &backend_startup).await?;
 
@@ -283,7 +534,19 @@ async fn create_backend(
                                 anyhow::bail!("non-IAM backend auth not implemented");
                             }
                         }
-                        _ => anyhow::bail!("unsupported auth method: {:?}", auth_req),
+                        pgproto::AuthRequest::Sasl(mechs) => {
+                            if iam_for_user {
+                                do_scram_client_auth(&mut backend, &mechs, &pool_key.db_user, config, token_cache).await?;
+                            } else {
+                                anyhow::bail!("non-IAM SCRAM auth not implemented");
+                            }
+                        }
+                        pgproto::AuthRequest::SaslContinue(_) => {
+                            anyhow::bail!("unexpected SASL continue from server");
+                        }
+                        pgproto::AuthRequest::Unknown(t, _) => {
+                            anyhow::bail!("unknown auth type {} from server", t);
+                        }
                     }
                 }
                 b'E' => {
@@ -294,13 +557,12 @@ async fn create_backend(
         }
     }
 
-    // Consume ParameterStatus + BackendKeyData + ReadyForQuery (we don't forward them;
-    // send_fake_ready already sent synthetic ones to the client)
+    // Consume ParameterStatus + BackendKeyData + ReadyForQuery
     loop {
         let msg = pgproto::read_pg_message(&mut backend).await?;
         match msg {
             None => anyhow::bail!("backend closed during startup phase"),
-            Some((type_byte, _payload)) => {
+            Some((type_byte, _)) => {
                 if type_byte == b'Z' {
                     break;
                 }
@@ -309,6 +571,76 @@ async fn create_backend(
     }
 
     Ok(backend)
+}
+
+/// Client-side SCRAM-SHA-256 exchange for IAM backend auth.
+async fn do_scram_client_auth(
+    backend: &mut ServerStream,
+    mechs: &[String],
+    user: &str,
+    config: &Config,
+    token_cache: Option<&Arc<TokenCache>>,
+) -> anyhow::Result<()> {
+    use crate::auth::scram::ScramClient;
+
+    if !mechs.iter().any(|m| m == "SCRAM-SHA-256") {
+        anyhow::bail!("backend doesn't offer SCRAM-SHA-256 (offers {:?})", mechs);
+    }
+
+    let iam_config = config.iam.as_ref().unwrap();
+    let iam_password = if let Some(cache) = token_cache {
+        cache.get().await?
+    } else {
+        crate::auth::get_token(iam_config).await?
+    };
+
+    let mut client = ScramClient::new(user, &iam_password);
+
+    // Send SASLInitialResponse
+    let client_first = client.build_client_first();
+    let payload = format!("SCRAM-SHA-256\x00{}", client_first);
+    pgproto::write_raw_message(backend, b'p', payload.as_bytes()).await?;
+    backend.flush().await?;
+
+    // Read SASLContinue
+    match pgproto::read_pg_message(backend).await? {
+        None => anyhow::bail!("backend closed during SASL"),
+        Some((b'R', data)) => {
+            let req = pgproto::parse_auth_request(&data)?;
+            match req {
+                pgproto::AuthRequest::SaslContinue(server_first) => {
+                    let sf = std::str::from_utf8(&server_first)?;
+                    client.parse_server_first(sf)?;
+                    let client_final = client.build_client_final()?;
+                    pgproto::write_raw_message(backend, b'p', client_final.as_bytes()).await?;
+                    backend.flush().await?;
+                }
+                _ => anyhow::bail!("expected SASLContinue, got {:?}", req),
+            }
+        }
+        Some((t, _)) => anyhow::bail!("expected SASLContinue, got {}", t as char),
+    }
+
+    // Read SASLFinal (or AuthenticationOk)
+    loop {
+        match pgproto::read_pg_message(backend).await? {
+            None => anyhow::bail!("backend closed during SASL final"),
+            Some((b'R', data)) => {
+                let req = pgproto::parse_auth_request(&data)?;
+                match req {
+                    pgproto::AuthRequest::Ok => return Ok(()),
+                    pgproto::AuthRequest::SaslContinue(server_final) => {
+                        let sf = std::str::from_utf8(&server_final)?;
+                        client.verify_server_final(sf)?;
+                        // Continue reading until AuthOk
+                    }
+                    _ => anyhow::bail!("unexpected auth request: {:?}", req),
+                }
+            }
+            Some((t, _)) if t != b'R' => continue,
+            Some((t, _)) => anyhow::bail!("unexpected message {} during SASL auth", t as char),
+        }
+    }
 }
 
 // ── Transaction pooling ────────────────────────────────────────────
@@ -324,7 +656,6 @@ async fn transaction_loop(
     let mut server: Option<ServerStream> = initial_server;
 
     loop {
-        // ── Ensure we have a server ──────────────────────────────
         if server.is_none() {
             server = acquire_backend(pool, pool_key, config, token_cache).await;
         }
@@ -333,13 +664,6 @@ async fn transaction_loop(
             break;
         }
 
-        // ── Bidirectional relay between client and server ────────
-        // We use tokio::select! to handle both directions concurrently.
-        // On ReadyForQuery('I') we release the server and loop back to acquire.
-        // On Terminate or disconnect we break out.
-
-        // Pre-construct the server-read future so we can use it in select!
-        // without borrow conflicts in the handlers.
         let server_borrow: *mut ServerStream =
             server.as_mut().map(|s| s as *mut ServerStream).unwrap();
         let server_ref = unsafe { &mut *server_borrow };
@@ -384,7 +708,6 @@ async fn transaction_loop(
                     break;
                 }
                 if t == b'Z' && p.first() == Some(&b'I') {
-                    // Release server to pool
                     if let Some(ref mut s) = server {
                         run_reset_query(s, config).await;
                     }
@@ -396,27 +719,23 @@ async fn transaction_loop(
         }
     }
 
-    // Cleanup: release server if still assigned
     if let Some(mut s) = server.take() {
         run_reset_query(&mut s, config).await;
         pool.release(pool_key, s).await;
     }
 }
 
-/// Try to acquire a backend: first from pool idle, then create new.
 async fn acquire_backend(
     pool: &Arc<PoolManager>,
     pool_key: &PoolKey,
     config: &Config,
     token_cache: Option<&Arc<TokenCache>>,
 ) -> Option<ServerStream> {
-    // First try idle
     if let Some(s) = pool.try_acquire_idle(pool_key).await {
         tracing::debug!("transaction_loop: acquired idle backend");
         return Some(s);
     }
 
-    // Reserve and create new
     if !pool.reserve(pool_key).await {
         tracing::warn!("transaction_loop: pool exhausted");
         return None;
@@ -432,13 +751,11 @@ async fn acquire_backend(
     }
 }
 
-/// Run the server_reset_query (e.g., DISCARD ALL) to clean state before pool return.
 async fn run_reset_query(
     server: &mut (impl tokio::io::AsyncRead + AsyncWriteExt + Unpin),
     config: &Config,
 ) {
     let reset_query = config.pool.server_reset_query.as_bytes();
-    // Build a Query message: 'Q' + len + query_text + \0
     let mut payload = reset_query.to_vec();
     payload.push(0);
     let len = (payload.len() + 4) as i32;
@@ -455,7 +772,6 @@ async fn run_reset_query(
         return;
     }
 
-    // Read and discard responses until ReadyForQuery
     loop {
         match pgproto::read_pg_message(server).await {
             Ok(Some((type_byte, _))) => {
@@ -483,8 +799,6 @@ async fn relay_and_release(
 
 // ── Pool warm-up ────────────────────────────────────────────────────
 
-/// After a connection is released, check if the pool needs warming up
-/// and spawn background tasks to create additional connections.
 async fn spawn_warmup(
     pool: &Arc<PoolManager>,
     pool_key: &PoolKey,

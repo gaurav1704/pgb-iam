@@ -1,6 +1,12 @@
 pub mod aws;
 pub mod gcp;
 pub mod cache;
+pub mod scram;
+pub mod hba;
+pub mod auth_query;
+pub mod pam_ffi;
+pub mod pam;
+pub mod ldap;
 
 use crate::config::IamConfig;
 
