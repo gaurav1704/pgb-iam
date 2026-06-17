@@ -32,51 +32,117 @@ This is fragile, operationally expensive, and undermines the security benefits o
               └──────────────┘
 ```
 
-### Key Features
-
-| Feature | Status |
-|---------|--------|
-| TCP proxy with connection pooling | ✅ Phase 1 |
-| Config file (TOML) | ✅ Phase 1 |
-| Prometheus metrics | ✅ Phase 1 |
-| Health check endpoint | ✅ Phase 1 |
-| PostgreSQL wire protocol parser | ✅ Phase 2 |
-| AWS RDS IAM token generation | ✅ Phase 2 |
-| Transparent auth injection (cleartext + MD5) | ✅ Phase 2 |
-| Token cache with auto-refresh | ✅ Phase 2 |
-| GCP Cloud SQL IAM auth | 🔧 Phase 2 (stub) |
-| TLS support (client→pooler + pooler→backend) | ✅ Phase 3 |
-| Health checks with reconnection logic | ✅ Phase 3 |
-| Admin interface (pool stats + health status) | ✅ Phase 3 |
-
-### How IAM Auth Works
-
-1. Client connects to pgb-iam with their database username
-2. pgb-iam reads the PostgreSQL startup packet, extracts the username
-3. pgb-iam connects to the backend (RDS/Cloud SQL) and forwards the startup
-4. When the backend requests a password, pgb-iam generates a fresh IAM token via the cloud provider's SDK
-5. The token is sent as the password (cleartext or MD5-hashed, matching the backend's auth method)
-6. Token is cached and automatically refreshed before expiry (~15 min for AWS, refreshed every 10 min)
-7. After authentication, all traffic is relayed transparently — clients don't know IAM is involved
-
-### Wire Protocol Flow
+### Two-Level Authentication
 
 ```
-Client          pgb-iam           Backend (RDS)
-  │                │                  │
-  │── Startup ────▶│── Startup ──────▶│
-  │                │◀─ AuthReq(R) ────│
-  │                │── Password(p) ──▶│  ← IAM token injected here
-  │                │◀─ AuthOk ────────│
-  │◀─ AuthOk ──────│                  │
-  │══════ relay ═══▶══════ relay ════▶│
+Client ──[trust/password]──▶ pgb-iam ──[IAM token]──▶ PostgreSQL
+                               │
+                               └── PoolManager ── holds ServerStreams
 ```
+
+1. **Client connection**: Authenticates to pgb-iam locally (`trust` or `password`)
+2. **Backend connection**: pgb-iam authenticates to PostgreSQL using IAM tokens (AWS RDS `GenerateDBAuthToken`)
+3. **Pooling**: Already-authenticated backend connections are stored in a per-`(host, port, db_user, dbname)` pool
+4. **Token lifecycle**: Tokens are cached and auto-refreshed via background task (10-min TTL, 5-min refresh check)
 
 ### Why Rust
 
-- **Performance**: Async I/O with Tokio is ideal for connection pooling — zero-cost abstractions, no GC pauses
+- **Performance**: Async I/O with Tokio — ideal for connection pooling, zero-cost abstractions, no GC pauses
 - **Safety**: No buffer overflows or use-after-free in the critical network path
 - **Ecosystem**: First-class AWS SDK, async Postgres protocol support, Prometheus instrumentation
+
+## Feature Comparison with PgBouncer
+
+### Pooling
+
+| Feature | PgBouncer | pgb-iam | Notes |
+|---|---|---|---|
+| Session pooling | ✅ | ✅ | Server assigned for client lifetime |
+| Transaction pooling | ✅ | ✅ | Server released on ReadyForQuery('I') |
+| Statement pooling | ✅ | ❌ | Not implemented |
+| Per-database pool size | ✅ | ❌ | Single global `max_size` |
+| Per-user pool size | ✅ | ❌ | Single global `max_size` |
+| Reserve pool | ✅ | ❌ | Emergency connections when pool exhausted |
+| LIFO / round-robin | ✅ | ❌ | FIFO only |
+| Min pool size (warm-up) | ✅ | ❌ | No pre-warming |
+
+### Authentication
+
+| Feature | PgBouncer | pgb-iam | Notes |
+|---|---|---|---|
+| Cleartext password | ✅ | ✅ | IAM token sent as cleartext |
+| MD5 password | ✅ | ✅ | IAM token MD5-hashed with server salt |
+| SCRAM-SHA-256 | ✅ | ❌ | Parsed but not handled |
+| PAM | ✅ | ❌ | Not implemented |
+| LDAP | ✅ | ❌ | Not implemented |
+| TLS client cert | ✅ | ❌ | `with_no_client_auth()` |
+| HBA (host-based) | ✅ | ❌ | `trust` / `password` only |
+| `auth_query` (DB lookup) | ✅ | ❌ | Not implemented |
+| **AWS RDS IAM** | ❌ | ✅ | Full `GenerateDBAuthToken` integration |
+| **GCP Cloud SQL IAM** | ❌ | ⚠️ | Stub only |
+| **Auto token refresh** | ❌ | ✅ | Background task, 5-min cycle |
+
+### TLS
+
+| Feature | PgBouncer | pgb-iam | Notes |
+|---|---|---|---|
+| Client TLS | ✅ Full | ⚠️ | `enabled: bool` only; no verify modes |
+| Server TLS | ✅ Full | ⚠️ | `connect_with_tls: bool` only |
+| Cipher / protocol selection | ✅ | ❌ | Uses rustls defaults |
+| Client cert validation | ✅ | ❌ | Not implemented |
+
+### Protocol
+
+| Feature | PgBouncer | pgb-iam | Notes |
+|---|---|---|---|
+| Wire protocol (startup, auth, relay) | ✅ | ✅ | Full basic flow |
+| SSLRequest / TLS upgrade | ✅ | ✅ | rustls accept/connect |
+| Extended query protocol | ✅ | ⚠️ | Relayed as opaque bytes |
+| Prepared statement tracking | ✅ | ❌ | Not tracked |
+| Cancel request | ✅ | ❌ | Not parsed |
+| Replication protocol | ✅ | ❌ | Not implemented |
+
+### Timeouts
+
+| Feature | PgBouncer | pgb-iam | Notes |
+|---|---|---|---|
+| `server_idle_timeout` | ✅ | ✅ | `idle_timeout_secs` in config |
+| `server_lifetime` | ✅ | ❌ | No max connection age |
+| `server_connect_timeout` | ✅ | ❌ | No connect deadline |
+| `query_timeout` | ✅ | ❌ | Not implemented |
+| `client_idle_timeout` | ✅ | ❌ | Not implemented |
+| `transaction_timeout` | ✅ | ❌ | Not implemented |
+| `query_wait_timeout` | ✅ | ❌ | Not implemented |
+
+### Admin & Monitoring
+
+| Feature | PgBouncer | pgb-iam | Notes |
+|---|---|---|---|
+| Admin console (`psql pgbouncer`) | ✅ | ❌ | HTTP JSON API instead |
+| SHOW commands (stats, pools, clients) | ✅ | ❌ | `GET /stats`, `GET /health` |
+| RECONNECT / PAUSE / RESUME / RELOAD | ✅ | ❌ | No live admin commands |
+| Online restart (`-R`) | ✅ | ❌ | Restart required for config changes |
+| Prometheus metrics | ⚠️ via SHOW + exporter | ✅ | Native `GET /metrics` |
+
+### Configuration
+
+| Feature | PgBouncer | pgb-iam | Notes |
+|---|---|---|---|
+| Config format | INI | TOML | Cleaner format |
+| Per-database settings | ✅ | ❌ | Single target backend |
+| Per-user settings | ✅ | ❌ | Single `db_user` |
+| Online reload (SIGHUP) | ✅ | ❌ | Not implemented |
+
+### Other
+
+| Feature | PgBouncer | pgb-iam | Notes |
+|---|---|---|---|
+| Unix sockets | ✅ | ❌ | TCP only |
+| SO_REUSEPORT (multi-process) | ✅ | ❌ | Single-process async |
+| `server_reset_query` | ✅ | ✅ | `DISCARD ALL` (configurable) |
+| `PoolManager` + `PoolKey` | ❌ | ✅ | Keyed by `(host, port, db_user, dbname)` |
+| `ServerStream` (Plain/TLS) | ❌ | ✅ | Unified I/O enum |
+| Two-level auth (local + IAM) | ❌ | ✅ | Unique to pgb-iam |
 
 ## Quick Start
 
@@ -99,20 +165,20 @@ curl http://127.0.0.1:9090/metrics
 
 ```
 src/
-├── main.rs          # Entry point, config loading, runtime setup
-├── config/          # TOML config deserialization
-├── pool/            # Connection pool (idle reaper, max size enforcement)
-├── proxy/           # TCP relay + IAM auth injection
-│   ├── mod.rs       # Client handler, TLS upgrade, auth flow, relay
-│   ├── health.rs    # Periodic backend health checks
-│   └── admin.rs     # HTTP admin API (stats, health status)
-├── pgproto/         # PostgreSQL wire protocol parser (startup, SSL, auth)
-├── auth/            # IAM token providers + token cache with auto-refresh
-├── tls/             # TLS accept/connect (rustls-based)
-└── metrics/         # Prometheus + health endpoint
+├── main.rs          Entry point, config loading, runtime setup
+├── config/          TOML config deserialization (listen, pool, client_auth, iam, tls, metrics, admin, health_check)
+├── pool/            PoolManager — maps of pools keyed by (host, port, db_user, dbname), acquire/release lifecycle
+├── proxy/           TCP relay + IAM auth injection + pool mode dispatch
+│   ├── mod.rs       Handler: client TLS → startup → local auth → pool acquire → relay
+│   ├── health.rs    Periodic backend health checks (TCP connect)
+│   └── admin.rs     HTTP admin API (GET /stats, GET /health)
+├── pgproto/         PostgreSQL wire protocol parser (startup, SSL, auth messages, relay)
+├── auth/            IAM token providers (AWS SDK) + token cache with auto-refresh
+├── tls/             TLS accept/connect (rustls + tokio-rustls)
+└── metrics/         Prometheus endpoint (GET /metrics)
 ```
 
-### Configuration
+## Configuration
 
 ```toml
 [listen]
@@ -120,13 +186,17 @@ addr = "127.0.0.1"
 port = 6432
 
 [pool]
-min_size = 2
+mode = "session"            # session | transaction
 max_size = 10
 idle_timeout_secs = 300
 target_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
 target_port = 5432
 dbname = "postgres"
-db_user = "postgres"
+db_user = "iam_user"
+
+[client_auth]
+type = "trust"              # trust | password
+# password = "mypassword"   # required if type = "password"
 
 [metrics]
 enabled = true
@@ -150,11 +220,11 @@ key_path = "server.key"
 connect_with_tls = false
 
 [iam]
-provider = "Aws"              # Aws | Gcp | None
+provider = "aws"            # aws | gcp | none
 region = "us-east-1"
 instance_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
 instance_port = 5432
-db_user = "iam_user"          # Which database user uses IAM auth
+db_user = "iam_user"
 ```
 
 ## License
