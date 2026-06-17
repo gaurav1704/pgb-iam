@@ -35,13 +35,13 @@ This is fragile, operationally expensive, and undermines the security benefits o
 ### Two-Level Authentication
 
 ```
-Client ──[trust/password]──▶ pgb-iam ──[IAM token]──▶ PostgreSQL
-                               │
-                               └── PoolManager ── holds ServerStreams
+Client ──[trust|password|SCRAM|cert|PAM|LDAP|HBA]──▶ pgb-iam ──[IAM token|SCRAM|MD5|cleartext]──▶ PostgreSQL
+                                                       │
+                                                       └── PoolManager ── holds ServerStreams
 ```
 
-1. **Client connection**: Authenticates to pgb-iam locally (`trust` or `password`)
-2. **Backend connection**: pgb-iam authenticates to PostgreSQL using IAM tokens (AWS RDS `GenerateDBAuthToken`)
+1. **Client connection**: Authenticates to pgb-iam locally via any of 8 methods: `trust`, `password` (cleartext), `scram-sha-256` (SASL), `cert` (TLS client certificate), `PAM`, `LDAP`, `hba` (pg_hba.conf-style rules), or `auth_query` (dynamic DB lookup)
+2. **Backend connection**: pgb-iam authenticates to PostgreSQL using IAM tokens (AWS RDS `GenerateDBAuthToken` / GCP Cloud SQL IAM) — supports `cleartext`, `MD5`, and `SCRAM-SHA-256` SASL for the backend auth handshake
 3. **Pooling**: Already-authenticated backend connections are stored in a per-`(host, port, db_user, dbname)` pool
 4. **Token lifecycle**: Tokens are cached and auto-refreshed via background task (10-min TTL, 5-min refresh check)
 
@@ -69,15 +69,15 @@ Client ──[trust/password]──▶ pgb-iam ──[IAM token]──▶ Postgr
 ### Authentication
 
 | Feature | PgBouncer | pgb-iam | Notes |
-|---|---|---|---|
+|---|---|---|---|---|
 | Cleartext password | ✅ | ✅ | IAM token sent as cleartext |
 | MD5 password | ✅ | ✅ | IAM token MD5-hashed with server salt |
-| SCRAM-SHA-256 | ✅ | ❌ | Parsed but not handled |
-| PAM | ✅ | ❌ | Not implemented |
-| LDAP | ✅ | ❌ | Not implemented |
-| TLS client cert | ✅ | ❌ | `with_no_client_auth()` |
-| HBA (host-based) | ✅ | ❌ | `trust` / `password` only |
-| `auth_query` (DB lookup) | ✅ | ❌ | Not implemented |
+| SCRAM-SHA-256 | ✅ | ✅ | Full SASL exchange (server + client) |
+| PAM | ✅ | ✅ | Custom FFI — no external dependencies |
+| LDAP | ✅ | ✅ | Async ldap3 bind + search + user verification |
+| TLS client cert | ✅ | ✅ | `client_ca` config, `WebPkiClientVerifier` |
+| HBA (host-based) | ✅ | ✅ | Inline matching by conn_type/db/user/address/TLS |
+| `auth_query` (DB lookup) | ✅ | ✅ | `SELECT ... FROM pg_shadow WHERE usename = $1` |
 | **AWS RDS IAM** | ❌ | ✅ | Full `GenerateDBAuthToken` integration |
 | **GCP Cloud SQL IAM** | ❌ | ⚠️ | Stub only |
 | **Auto token refresh** | ❌ | ✅ | Background task, 5-min cycle |
@@ -85,11 +85,11 @@ Client ──[trust/password]──▶ pgb-iam ──[IAM token]──▶ Postgr
 ### TLS
 
 | Feature | PgBouncer | pgb-iam | Notes |
-|---|---|---|---|
-| Client TLS | ✅ Full | ⚠️ | `enabled: bool` only; no verify modes |
+|---|---|---|---|---|
+| Client TLS | ✅ Full | ✅ | rustls accept with optional client CA |
 | Server TLS | ✅ Full | ⚠️ | `connect_with_tls: bool` only |
 | Cipher / protocol selection | ✅ | ❌ | Uses rustls defaults |
-| Client cert validation | ✅ | ❌ | Not implemented |
+| Client cert validation | ✅ | ✅ | `client_ca` → `WebPkiClientVerifier` |
 
 ### Protocol
 
@@ -173,7 +173,16 @@ src/
 │   ├── health.rs    Periodic backend health checks (TCP connect)
 │   └── admin.rs     HTTP admin API (GET /stats, GET /health)
 ├── pgproto/         PostgreSQL wire protocol parser (startup, SSL, auth messages, relay)
-├── auth/            IAM token providers (AWS SDK) + token cache with auto-refresh
+├── auth/            IAM token providers, SCRAM, HBA, auth_query, PAM, LDAP + token cache
+│   ├── aws.rs       AWS RDS GenerateDBAuthToken
+│   ├── gcp.rs       GCP Cloud SQL IAM (stub)
+│   ├── cache.rs     Token cache with auto-refresh (10-min TTL)
+│   ├── scram.rs     SCRAM-SHA-256 client + server
+│   ├── hba.rs       HBA rule parser (conn_type/db/user/address matching)
+│   ├── auth_query.rs Dynamic password lookup from PostgreSQL
+│   ├── pam_ffi.rs   Minimal PAM FFI (libpam bindings)
+│   ├── pam.rs       PAM authentication wrapper
+│   └── ldap.rs      LDAP authentication (async ldap3)
 ├── tls/             TLS accept/connect (rustls + tokio-rustls)
 └── metrics/         Prometheus endpoint (GET /metrics)
 ```
@@ -204,8 +213,37 @@ db_user = "iam_user"
 "admin" = { max_size = 15, reserve_size = 5 }
 
 [client_auth]
-type = "trust"              # trust | password
-# password = "mypassword"   # required if type = "password"
+# type = "trust"             # trust | password | scram-sha-256 | cert | pam | ldap | hba | auth_query
+# password = "mypassword"    # required for password / scram-sha-256
+# client_ca = "ca.pem"       # required for cert auth
+# pam_service = "pgb-iam"    # required for pam auth
+
+# For auth_query:
+# [client_auth.auth_query]
+# user = "pgb_iam_auth"
+# query = "SELECT passwd FROM pg_shadow WHERE usename = $1"
+
+# For LDAP:
+# [client_auth.ldap]
+# uri = "ldap://ldap.example.com"
+# bind_dn = "cn=admin,dc=example,dc=com"
+# bind_password = "admin_pass"
+# search_base = "dc=example,dc=com"
+# search_filter = "(uid=$1)"
+
+# For HBA (rules are evaluated in order, first match wins):
+# [[client_auth.hba_rules]]
+# type = "hostssl"
+# database = ["all"]
+# user = ["all"]
+# address = "0.0.0.0/0"
+# auth = "cert"
+# [[client_auth.hba_rules]]
+# type = "host"
+# database = ["mydb"]
+# user = ["admin"]
+# address = "10.0.0.0/8"
+# auth = "scram-sha-256"
 
 [metrics]
 enabled = true
@@ -235,6 +273,44 @@ instance_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
 instance_port = 5432
 db_user = "iam_user"
 ```
+
+## Authentication Methods
+
+### Client Auth (method → how pgb-iam verifies the client)
+
+| Method | Description |
+|---|---|
+| `trust` | No password required — accepts all connections |
+| `password` | Cleartext password — matched against `password` field or `auth_query` |
+| `scram-sha-256` | SASL SCRAM-SHA-256 exchange — password from `password` or `auth_query` |
+| `cert` | TLS client certificate — validated against `client_ca` root |
+| `pam` | Delegates to system PAM service (e.g., `/etc/pam.d/pgb-iam`) |
+| `ldap` | Binds as admin, searches for user DN, then rebinds as user |
+| `hba` | Evaluates `hba_rules` in order — each rule specifies method + filter |
+| `auth_query` | Queries PostgreSQL (`SELECT passwd FROM pg_shadow`) for dynamic password |
+
+### Backend Auth (how pgb-iam authenticates to PostgreSQL)
+
+Once the client is authenticated, pgb-iam connects to PostgreSQL using IAM tokens or passwords. The backend auth flow automatically selects the method requested by the server:
+
+1. **Cleartext** — IAM password token sent directly
+2. **MD5** — IAM token MD5-hashed with server salt (`md5{hash}`)
+3. **SCRAM-SHA-256** — Full SASL client exchange using IAM token as password
+
+### HBA Rule Evaluation
+
+HBA rules are processed **in order** for each connection. The first matching rule determines the auth method:
+
+```
+[[client_auth.hba_rules]]
+type = "hostssl"     # hostssl | hostnossl | host | local
+database = ["all"]   # "all", "sameuser", or specific DB names
+user = ["all"]       # "all" or specific user names
+address = "0.0.0.0/0"  # CIDR notation
+auth = "cert"        # trust | reject | password | scram-sha-256 | cert | pam | ldap
+```
+
+If no rule matches, the connection is **rejected**.
 
 ## License
 
