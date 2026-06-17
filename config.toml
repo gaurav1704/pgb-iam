@@ -15,3 +15,10 @@ db_user = "postgres"
 enabled = true
 listen_addr = "127.0.0.1"
 listen_port = 9090
+
+[iam]
+provider = "Aws"
+region = "us-east-1"
+instance_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
+instance_port = 5432
+db_user = "iam_user"

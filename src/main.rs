@@ -3,10 +3,13 @@ mod pool;
 mod proxy;
 mod auth;
 mod metrics;
+mod pgproto;
 
 use std::sync::Arc;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+use crate::auth::cache::TokenCache;
 
 #[derive(Parser)]
 struct Args {
@@ -28,6 +31,13 @@ async fn main() -> anyhow::Result<()> {
     let pool = Arc::new(pool::Pool::new(&config));
     let proxy_config = config.clone();
 
+    let token_cache: Option<Arc<TokenCache>> = config.iam.as_ref().map(|iam| {
+        let cache = Arc::new(TokenCache::new(iam.clone()));
+        let cache_clone = cache.clone();
+        tokio::spawn(async move { cache_clone.spawn_refresh_task().await });
+        cache
+    });
+
     if let Some(metrics_config) = &config.metrics {
         if metrics_config.enabled {
             let metrics_addr = format!("{}:{}", metrics_config.listen_addr, metrics_config.listen_port);
@@ -40,6 +50,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    proxy::run(pool, proxy_config).await?;
+    proxy::run(pool, proxy_config, token_cache).await?;
     Ok(())
 }

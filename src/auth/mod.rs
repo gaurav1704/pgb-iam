@@ -1,23 +1,13 @@
 pub mod aws;
 pub mod gcp;
+pub mod cache;
 
 use crate::config::IamConfig;
 
-pub enum IamToken {
-    Aws(String),
-    Gcp(String),
-}
-
-pub async fn get_token(config: &IamConfig) -> anyhow::Result<IamToken> {
+pub async fn get_token(config: &IamConfig) -> anyhow::Result<String> {
     match config.provider {
-        crate::config::IamProvider::Aws => {
-            let token = aws::generate_token(config).await?;
-            Ok(IamToken::Aws(token))
-        }
-        crate::config::IamProvider::Gcp => {
-            let token = gcp::generate_token(config).await?;
-            Ok(IamToken::Gcp(token))
-        }
+        crate::config::IamProvider::Aws => aws::generate_token(config).await,
+        crate::config::IamProvider::Gcp => gcp::generate_token(config).await,
         crate::config::IamProvider::None => {
             anyhow::bail!("no IAM provider configured")
         }
