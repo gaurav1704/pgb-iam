@@ -40,6 +40,12 @@ pub struct PoolConfig {
     pub db_user: String,
     #[serde(default)]
     pub mode: PoolMode,
+    #[serde(default = "default_reset_query")]
+    pub server_reset_query: String,
+}
+
+fn default_reset_query() -> String {
+    "DISCARD ALL".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
