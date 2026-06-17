@@ -16,6 +16,22 @@ enabled = true
 listen_addr = "127.0.0.1"
 listen_port = 9090
 
+[admin]
+enabled = true
+listen_addr = "127.0.0.1"
+listen_port = 9091
+
+[health_check]
+enabled = true
+interval_secs = 30
+timeout_secs = 5
+
+[tls]
+enabled = false
+cert_path = "server.crt"
+key_path = "server.key"
+connect_with_tls = false
+
 [iam]
 provider = "Aws"
 region = "us-east-1"

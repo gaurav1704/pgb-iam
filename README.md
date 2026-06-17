@@ -45,7 +45,9 @@ This is fragile, operationally expensive, and undermines the security benefits o
 | Transparent auth injection (cleartext + MD5) | ✅ Phase 2 |
 | Token cache with auto-refresh | ✅ Phase 2 |
 | GCP Cloud SQL IAM auth | 🔧 Phase 2 (stub) |
-| TLS support | 📋 Phase 3 |
+| TLS support (client→pooler + pooler→backend) | ✅ Phase 3 |
+| Health checks with reconnection logic | ✅ Phase 3 |
+| Admin interface (pool stats + health status) | ✅ Phase 3 |
 
 ### How IAM Auth Works
 
@@ -101,8 +103,12 @@ src/
 ├── config/          # TOML config deserialization
 ├── pool/            # Connection pool (idle reaper, max size enforcement)
 ├── proxy/           # TCP relay + IAM auth injection
-├── pgproto/         # PostgreSQL wire protocol parser (startup, auth messages)
+│   ├── mod.rs       # Client handler, TLS upgrade, auth flow, relay
+│   ├── health.rs    # Periodic backend health checks
+│   └── admin.rs     # HTTP admin API (stats, health status)
+├── pgproto/         # PostgreSQL wire protocol parser (startup, SSL, auth)
 ├── auth/            # IAM token providers + token cache with auto-refresh
+├── tls/             # TLS accept/connect (rustls-based)
 └── metrics/         # Prometheus + health endpoint
 ```
 
@@ -126,6 +132,22 @@ db_user = "postgres"
 enabled = true
 listen_addr = "127.0.0.1"
 listen_port = 9090
+
+[admin]
+enabled = true
+listen_addr = "127.0.0.1"
+listen_port = 9091
+
+[health_check]
+enabled = true
+interval_secs = 30
+timeout_secs = 5
+
+[tls]
+enabled = false
+cert_path = "server.crt"
+key_path = "server.key"
+connect_with_tls = false
 
 [iam]
 provider = "Aws"              # Aws | Gcp | None

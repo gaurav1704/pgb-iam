@@ -41,11 +41,36 @@ pub struct MetricsConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct TlsConfig {
+    pub enabled: bool,
+    pub cert_path: String,
+    pub key_path: String,
+    pub connect_with_tls: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AdminConfig {
+    pub enabled: bool,
+    pub listen_addr: String,
+    pub listen_port: u16,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HealthCheckConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub listen: ListenConfig,
     pub pool: PoolConfig,
     pub iam: Option<IamConfig>,
     pub metrics: Option<MetricsConfig>,
+    pub tls: Option<TlsConfig>,
+    pub admin: Option<AdminConfig>,
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl Config {

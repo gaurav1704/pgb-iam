@@ -1,8 +1,7 @@
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const PROTOCOL_VERSION_3: i32 = 196608; // 3.0
+const PROTOCOL_VERSION_3: i32 = 196608;
+const SSL_REQUEST_CODE: i32 = 80877103;
 
 #[derive(Debug)]
 pub struct StartupParams {
@@ -21,8 +20,15 @@ pub enum AuthRequest {
     Unknown(i32, Vec<u8>),
 }
 
-/// Read a complete PostgreSQL message: 1-byte type + 4-byte length + payload
-pub async fn read_pg_message(stream: &mut TcpStream) -> anyhow::Result<Option<(u8, Vec<u8>)>> {
+#[derive(Debug)]
+pub enum InitialMessage {
+    SslRequest,
+    Startup(StartupParams),
+}
+
+pub async fn read_pg_message(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> anyhow::Result<Option<(u8, Vec<u8>)>> {
     let mut type_byte = [0u8; 1];
     if stream.read_exact(&mut type_byte).await.is_err() {
         return Ok(None);
@@ -40,13 +46,27 @@ pub async fn read_pg_message(stream: &mut TcpStream) -> anyhow::Result<Option<(u
     Ok(Some((type_byte[0], payload)))
 }
 
-/// The startup message has no type byte — just length + protocol + params
-pub async fn read_startup_message(stream: &mut TcpStream) -> anyhow::Result<StartupParams> {
+pub async fn read_initial_message(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> anyhow::Result<InitialMessage> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
-    let len = i32::from_be_bytes(len_buf) as usize - 4;
+    let len = i32::from_be_bytes(len_buf) as usize;
 
-    let mut buf = vec![0u8; len];
+    // SSLRequest is exactly 8 bytes total: len=8 + code=80877103
+    if len == 8 {
+        let mut code_buf = [0u8; 4];
+        stream.read_exact(&mut code_buf).await?;
+        let code = i32::from_be_bytes(code_buf);
+        if code == SSL_REQUEST_CODE {
+            return Ok(InitialMessage::SslRequest);
+        }
+        anyhow::bail!("unknown protocol message: len={} code={}", len, code);
+    }
+
+    // Startup message: len includes itself (4) + protocol (4) + params
+    let payload_len = len - 4;
+    let mut buf = vec![0u8; payload_len];
     stream.read_exact(&mut buf).await?;
 
     let protocol = i32::from_be_bytes(buf[0..4].try_into().unwrap());
@@ -62,7 +82,7 @@ pub async fn read_startup_message(stream: &mut TcpStream) -> anyhow::Result<Star
             None => break,
             Some(key_end) => {
                 if key_end == offset {
-                    break; // trailing null
+                    break;
                 }
                 let key = String::from_utf8_lossy(&buf[offset..key_end]).to_string();
                 offset = key_end + 1;
@@ -91,29 +111,24 @@ pub async fn read_startup_message(stream: &mut TcpStream) -> anyhow::Result<Star
         .map(|(_, v)| v.clone())
         .unwrap_or_else(|| user.clone());
 
-    Ok(StartupParams { user, database, params })
+    Ok(InitialMessage::Startup(StartupParams { user, database, params }))
 }
 
-/// Write a StartupMessage (no type byte): int32 len, int32 protocol, then key-value pairs
 pub async fn write_startup_message(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     params: &StartupParams,
 ) -> anyhow::Result<()> {
     let mut buf = Vec::new();
-
-    // protocol version
     buf.extend_from_slice(&PROTOCOL_VERSION_3.to_be_bytes());
 
-    // key-value pairs
     for (key, value) in &params.params {
         buf.extend_from_slice(key.as_bytes());
         buf.push(0);
         buf.extend_from_slice(value.as_bytes());
         buf.push(0);
     }
-    buf.push(0); // trailing null
+    buf.push(0);
 
-    // write length-prefixed message
     let len = (buf.len() + 4) as i32;
     let mut header = len.to_be_bytes().to_vec();
     header.extend_from_slice(&buf);
@@ -122,23 +137,24 @@ pub async fn write_startup_message(
     Ok(())
 }
 
-/// Send a PasswordMessage: 'p' + int32 len + password
-pub async fn send_password(stream: &mut TcpStream, password: &str) -> anyhow::Result<()> {
+pub async fn send_password(
+    stream: &mut (impl AsyncWrite + Unpin),
+    password: &str,
+) -> anyhow::Result<()> {
     let payload = password.as_bytes();
-    let len = (payload.len() + 4 + 1) as i32; // +1 for null terminator
+    let len = (payload.len() + 4 + 1) as i32;
 
     let mut msg = Vec::with_capacity(1 + 4 + payload.len() + 1);
     msg.push(b'p');
     msg.extend_from_slice(&len.to_be_bytes());
     msg.extend_from_slice(payload);
-    msg.push(0); // null-terminated
+    msg.push(0);
 
     stream.write_all(&msg).await?;
     stream.flush().await?;
     Ok(())
 }
 
-/// Parse an AuthenticationRequest from the server
 pub fn parse_auth_request(payload: &[u8]) -> anyhow::Result<AuthRequest> {
     if payload.len() < 4 {
         anyhow::bail!("auth response too short");
@@ -158,7 +174,6 @@ pub fn parse_auth_request(payload: &[u8]) -> anyhow::Result<AuthRequest> {
             Ok(AuthRequest::MD5Password(salt))
         }
         10 => {
-            // SASL: list of null-terminated mechanism strings
             let mechs = rest
                 .split(|&b| b == 0)
                 .filter(|s| !s.is_empty())
@@ -167,14 +182,33 @@ pub fn parse_auth_request(payload: &[u8]) -> anyhow::Result<AuthRequest> {
             Ok(AuthRequest::Sasl(mechs))
         }
         11 => Ok(AuthRequest::SaslContinue(rest.to_vec())),
-        t => {
-            Ok(AuthRequest::Unknown(t, rest.to_vec()))
-        }
+        t => Ok(AuthRequest::Unknown(t, rest.to_vec())),
     }
 }
 
-/// Relay raw bytes bidirectionally until one side disconnects
-pub async fn relay(mut client: TcpStream, mut server: TcpStream) {
-    use tokio::io;
-    let _ = io::copy_bidirectional(&mut client, &mut server).await;
+pub async fn relay(
+    mut client: impl AsyncRead + AsyncWrite + Unpin,
+    mut server: impl AsyncRead + AsyncWrite + Unpin,
+) {
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+}
+
+pub async fn send_ssl_accept(
+    stream: &mut (impl AsyncWrite + Unpin),
+) -> anyhow::Result<()> {
+    stream.write_all(b"S").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+pub async fn ssl_request(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+) -> anyhow::Result<bool> {
+    let msg = [0u8, 0, 0, 8, 4, 210, 44, 143]; // int32 8, int32 80877103
+    stream.write_all(&msg).await?;
+    stream.flush().await?;
+
+    let mut resp = [0u8; 1];
+    stream.read_exact(&mut resp).await?;
+    Ok(resp[0] == b'S')
 }
