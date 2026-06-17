@@ -3,13 +3,16 @@ addr = "127.0.0.1"
 port = 6432
 
 [pool]
-min_size = 2
+mode = "session"
 max_size = 10
 idle_timeout_secs = 300
 target_host = "localhost"
 target_port = 5432
 dbname = "postgres"
 db_user = "postgres"
+
+[client_auth]
+type = "trust"
 
 [metrics]
 enabled = true
@@ -33,7 +36,7 @@ key_path = "server.key"
 connect_with_tls = false
 
 [iam]
-provider = "Aws"
+provider = "aws"
 region = "us-east-1"
 instance_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
 instance_port = 5432

@@ -1,8 +1,8 @@
 use axum::{routing::get, Router};
 use std::sync::Arc;
-use crate::pool::Pool;
+use crate::pool::PoolManager;
 
-pub async fn serve(pool: Arc<Pool>, addr: &str) -> anyhow::Result<()> {
+pub async fn serve(pool: Arc<PoolManager>, addr: &str) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
@@ -15,9 +15,9 @@ pub async fn serve(pool: Arc<Pool>, addr: &str) -> anyhow::Result<()> {
 }
 
 async fn metrics_handler(
-    axum::extract::State(pool): axum::extract::State<Arc<Pool>>,
+    axum::extract::State(pool): axum::extract::State<Arc<PoolManager>>,
 ) -> String {
-    let stats = pool.stats().await;
+    let stats = pool.global_stats().await;
     format!(
         "# HELP pgb_iam_idle_connections Idle connections in pool\n\
          # TYPE pgb_iam_idle_connections gauge\n\

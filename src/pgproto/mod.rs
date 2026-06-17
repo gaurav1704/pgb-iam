@@ -11,6 +11,7 @@ pub struct StartupParams {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum AuthRequest {
     Ok,
     CleartextPassword,
@@ -186,6 +187,7 @@ pub fn parse_auth_request(payload: &[u8]) -> anyhow::Result<AuthRequest> {
     }
 }
 
+#[allow(dead_code)]
 pub async fn relay(
     mut client: impl AsyncRead + AsyncWrite + Unpin,
     mut server: impl AsyncRead + AsyncWrite + Unpin,
@@ -211,4 +213,40 @@ pub async fn ssl_request(
     let mut resp = [0u8; 1];
     stream.read_exact(&mut resp).await?;
     Ok(resp[0] == b'S')
+}
+
+/// Write a full PostgreSQL message (type byte + length + payload).
+pub async fn write_raw_message(
+    stream: &mut (impl AsyncWrite + Unpin),
+    type_byte: u8,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let len = (payload.len() + 4) as i32;
+    let mut buf = Vec::with_capacity(1 + 4 + payload.len());
+    buf.push(type_byte);
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(payload);
+    stream.write_all(&buf).await?;
+    Ok(())
+}
+
+/// Build a PostgreSQL ErrorResponse bytes (without the length prefix).
+pub fn build_error_response(code: &str, message: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(b'S'); // Severity
+    payload.extend_from_slice(b"ERROR");
+    payload.push(0);
+    payload.push(b'C'); // Code
+    payload.extend_from_slice(code.as_bytes());
+    payload.push(0);
+    payload.push(b'M'); // Message
+    payload.extend_from_slice(message.as_bytes());
+    payload.push(0);
+    payload.push(0); // Terminator
+    let len = (payload.len() + 4) as i32;
+    let mut msg = Vec::with_capacity(1 + 4 + payload.len());
+    msg.push(b'E');
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&payload);
+    msg
 }

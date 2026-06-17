@@ -3,16 +3,16 @@ use axum::routing::get;
 use axum::Router;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::pool::Pool;
+use crate::pool::PoolManager;
 use crate::proxy::health::HealthStatus;
 
 struct AdminState {
-    pool: Arc<Pool>,
+    pool: Arc<PoolManager>,
     health: Option<Arc<RwLock<HealthStatus>>>,
 }
 
 pub async fn serve(
-    pool: Arc<Pool>,
+    pool: Arc<PoolManager>,
     health: Option<Arc<RwLock<HealthStatus>>>,
     addr: &str,
 ) -> anyhow::Result<()> {
@@ -30,7 +30,7 @@ pub async fn serve(
 }
 
 async fn stats_handler(State(state): State<Arc<AdminState>>) -> String {
-    let pool_stats = state.pool.stats().await;
+    let pool_stats = state.pool.global_stats().await;
     format!(
         "{{\n  \"pool\": {{\n    \"idle\": {},\n    \"active\": {},\n    \"max\": {}\n  }}\n}}\n",
         pool_stats.idle, pool_stats.active, pool_stats.max,

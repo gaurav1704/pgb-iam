@@ -28,10 +28,18 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = config::load(&args.config).await?;
 
-    tracing::info!("starting pgb-iam on {}:{}", config.listen.addr, config.listen.port);
+    tracing::info!(
+        "starting pgb-iam on {}:{} (pool max={}, mode={:?})",
+        config.listen.addr,
+        config.listen.port,
+        config.pool.max_size,
+        config.pool.mode,
+    );
 
-    let pool = Arc::new(pool::Pool::new(&config));
-    let proxy_config = config.clone();
+    let pool_manager = Arc::new(pool::PoolManager::new(
+        config.pool.max_size as usize,
+        config.pool.idle_timeout_secs,
+    ));
 
     let token_cache: Option<Arc<TokenCache>> = config.iam.as_ref().map(|iam| {
         let cache = Arc::new(TokenCache::new(iam.clone()));
@@ -54,9 +62,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(metrics_config) = &config.metrics {
         if metrics_config.enabled {
             let metrics_addr = format!("{}:{}", metrics_config.listen_addr, metrics_config.listen_port);
-            let pool_clone = pool.clone();
+            let pool = pool_manager.clone();
             tokio::spawn(async move {
-                if let Err(e) = metrics::serve(pool_clone, &metrics_addr).await {
+                if let Err(e) = metrics::serve(pool, &metrics_addr).await {
                     tracing::error!("metrics server failed: {}", e);
                 }
             });
@@ -66,16 +74,16 @@ async fn main() -> anyhow::Result<()> {
     if let Some(admin_config) = &config.admin {
         if admin_config.enabled {
             let admin_addr = format!("{}:{}", admin_config.listen_addr, admin_config.listen_port);
-            let pool_clone = pool.clone();
+            let pool = pool_manager.clone();
             let health_clone = health_handle.clone();
             tokio::spawn(async move {
-                if let Err(e) = proxy::admin::serve(pool_clone, health_clone, &admin_addr).await {
+                if let Err(e) = proxy::admin::serve(pool, health_clone, &admin_addr).await {
                     tracing::error!("admin server failed: {}", e);
                 }
             });
         }
     }
 
-    proxy::run(pool, proxy_config, token_cache).await?;
+    proxy::run(pool_manager, config, token_cache).await?;
     Ok(())
 }
