@@ -32,8 +32,8 @@ pub async fn serve(
 async fn stats_handler(State(state): State<Arc<AdminState>>) -> String {
     let pool_stats = state.pool.global_stats().await;
     format!(
-        "{{\n  \"pool\": {{\n    \"idle\": {},\n    \"active\": {},\n    \"max\": {}\n  }}\n}}\n",
-        pool_stats.idle, pool_stats.active, pool_stats.max,
+        "{{\n  \"pool\": {{\n    \"idle\": {},\n    \"active\": {},\n    \"max\": {},\n    \"reserve\": {},\n    \"min\": {}\n  }}\n}}\n",
+        pool_stats.idle, pool_stats.active, pool_stats.max, pool_stats.reserve, pool_stats.min,
     )
 }
 

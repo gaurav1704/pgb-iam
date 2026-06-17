@@ -36,10 +36,7 @@ async fn main() -> anyhow::Result<()> {
         config.pool.mode,
     );
 
-    let pool_manager = Arc::new(pool::PoolManager::new(
-        config.pool.max_size as usize,
-        config.pool.idle_timeout_secs,
-    ));
+    let pool_manager = Arc::new(pool::PoolManager::new(&config.pool));
 
     let token_cache: Option<Arc<TokenCache>> = config.iam.as_ref().map(|iam| {
         let cache = Arc::new(TokenCache::new(iam.clone()));

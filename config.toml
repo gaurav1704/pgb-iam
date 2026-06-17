@@ -4,12 +4,21 @@ port = 6432
 
 [pool]
 mode = "session"
+strategy = "lifo"
 max_size = 10
+min_size = 2
+reserve_size = 2
 idle_timeout_secs = 300
 target_host = "localhost"
 target_port = 5432
 dbname = "postgres"
 db_user = "postgres"
+
+[pool.database_limits]
+"postgres" = { max_size = 20, min_size = 1 }
+
+[pool.user_limits]
+"admin" = { max_size = 15 }
 
 [client_auth]
 type = "trust"

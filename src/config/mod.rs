@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -31,8 +32,34 @@ impl Default for PoolMode {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum PoolStrategy {
+    Lifo,
+    Fifo,
+}
+
+impl Default for PoolStrategy {
+    fn default() -> Self {
+        Self::Lifo
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PoolLimits {
+    pub max_size: Option<u32>,
+    pub min_size: Option<u32>,
+    pub reserve_size: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct PoolConfig {
     pub max_size: u32,
+    #[serde(default)]
+    pub min_size: u32,
+    #[serde(default)]
+    pub reserve_size: u32,
+    #[serde(default)]
+    pub strategy: PoolStrategy,
     pub idle_timeout_secs: u64,
     pub target_host: String,
     pub target_port: u16,
@@ -42,6 +69,10 @@ pub struct PoolConfig {
     pub mode: PoolMode,
     #[serde(default = "default_reset_query")]
     pub server_reset_query: String,
+    #[serde(default)]
+    pub database_limits: HashMap<String, PoolLimits>,
+    #[serde(default)]
+    pub user_limits: HashMap<String, PoolLimits>,
 }
 
 fn default_reset_query() -> String {

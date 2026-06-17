@@ -82,6 +82,7 @@ async fn handle_client(
                 transaction_loop(client, Some(backend), &pool_key, &pool, config, token_cache).await;
             }
         }
+        spawn_warmup(&pool, &pool_key, config, token_cache).await;
         return Ok(());
     }
 
@@ -105,6 +106,8 @@ async fn handle_client(
             transaction_loop(client, Some(backend), &pool_key, &pool, config, token_cache).await;
         }
     }
+
+    spawn_warmup(&pool, &pool_key, config, token_cache).await;
     Ok(())
 }
 
@@ -476,6 +479,46 @@ async fn relay_and_release(
     let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
     pool.release(pool_key, server).await;
     tracing::debug!("released backend to pool");
+}
+
+// ── Pool warm-up ────────────────────────────────────────────────────
+
+/// After a connection is released, check if the pool needs warming up
+/// and spawn background tasks to create additional connections.
+async fn spawn_warmup(
+    pool: &Arc<PoolManager>,
+    pool_key: &PoolKey,
+    config: &Config,
+    token_cache: Option<&Arc<TokenCache>>,
+) {
+    let needed = pool.needs_warmup(pool_key).await;
+    if needed == 0 {
+        return;
+    }
+    tracing::info!("warming up pool ({} connections needed) for {}@{}", needed, pool_key.db_user, pool_key.dbname);
+
+    for _ in 0..needed {
+        let pool = pool.clone();
+        let key = pool_key.clone();
+        let config = config.clone();
+        let token_cache = token_cache.cloned();
+
+        tokio::spawn(async move {
+            if !pool.reserve(&key).await {
+                return;
+            }
+            match create_backend(&config, &key, token_cache.as_ref()).await {
+                Ok(stream) => {
+                    pool.release(&key, stream).await;
+                    tracing::debug!("warm-up connection created for {}@{}", key.db_user, key.dbname);
+                }
+                Err(e) => {
+                    pool.cancel_reservation(&key).await;
+                    tracing::warn!("warm-up connection failed for {}@{}: {}", key.db_user, key.dbname, e);
+                }
+            }
+        });
+    }
 }
 
 // ── MD5 helper ──────────────────────────────────────────────────────

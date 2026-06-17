@@ -25,10 +25,16 @@ async fn metrics_handler(
          # HELP pgb_iam_active_connections Active connections\n\
          # TYPE pgb_iam_active_connections gauge\n\
          pgb_iam_active_connections {}\n\
-         # HELP pgb_iam_max_connections Max pool size\n\
+         # HELP pgb_iam_max_connections Max pool size (excl. reserve)\n\
          # TYPE pgb_iam_max_connections gauge\n\
-         pgb_iam_max_connections {}\n",
-        stats.idle, stats.active, stats.max,
+         pgb_iam_max_connections {}\n\
+         # HELP pgb_iam_reserve_connections Reserve pool capacity\n\
+         # TYPE pgb_iam_reserve_connections gauge\n\
+         pgb_iam_reserve_connections {}\n\
+         # HELP pgb_iam_min_connections Min pool size target\n\
+         # TYPE pgb_iam_min_connections gauge\n\
+         pgb_iam_min_connections {}\n",
+        stats.idle, stats.active, stats.max, stats.reserve, stats.min,
     )
 }
 
