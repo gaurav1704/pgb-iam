@@ -56,15 +56,15 @@ Client ──[trust/password]──▶ pgb-iam ──[IAM token]──▶ Postgr
 ### Pooling
 
 | Feature | PgBouncer | pgb-iam | Notes |
-|---|---|---|---|
+|---|---|---|---|---|
 | Session pooling | ✅ | ✅ | Server assigned for client lifetime |
 | Transaction pooling | ✅ | ✅ | Server released on ReadyForQuery('I') |
 | Statement pooling | ✅ | ❌ | Not implemented |
-| Per-database pool size | ✅ | ❌ | Single global `max_size` |
-| Per-user pool size | ✅ | ❌ | Single global `max_size` |
-| Reserve pool | ✅ | ❌ | Emergency connections when pool exhausted |
-| LIFO / round-robin | ✅ | ❌ | FIFO only |
-| Min pool size (warm-up) | ✅ | ❌ | No pre-warming |
+| Per-database pool size | ✅ | ✅ | `[pool.database_limits]` table |
+| Per-user pool size | ✅ | ✅ | `[pool.user_limits]` table |
+| Reserve pool | ✅ | ✅ | `reserve_size` — burst beyond `max_size` |
+| LIFO / round-robin | ✅ | ✅ | LIFO default; `strategy = "fifo"` opt-in |
+| Min pool size (warm-up) | ✅ | ✅ | `min_size` — background spawn after relay |
 
 ### Authentication
 
@@ -127,10 +127,10 @@ Client ──[trust/password]──▶ pgb-iam ──[IAM token]──▶ Postgr
 ### Configuration
 
 | Feature | PgBouncer | pgb-iam | Notes |
-|---|---|---|---|
+|---|---|---|---|---|
 | Config format | INI | TOML | Cleaner format |
-| Per-database settings | ✅ | ❌ | Single target backend |
-| Per-user settings | ✅ | ❌ | Single `db_user` |
+| Per-database settings | ✅ | ✅ | `[pool.database_limits]` table |
+| Per-user settings | ✅ | ✅ | `[pool.user_limits]` table |
 | Online reload (SIGHUP) | ✅ | ❌ | Not implemented |
 
 ### Other
@@ -187,12 +187,21 @@ port = 6432
 
 [pool]
 mode = "session"            # session | transaction
+strategy = "lifo"           # lifo (default) | fifo
 max_size = 10
+min_size = 2
+reserve_size = 2
 idle_timeout_secs = 300
 target_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
 target_port = 5432
 dbname = "postgres"
 db_user = "iam_user"
+
+[pool.database_limits]
+"postgres" = { max_size = 20, min_size = 1 }
+
+[pool.user_limits]
+"admin" = { max_size = 15, reserve_size = 5 }
 
 [client_auth]
 type = "trust"              # trust | password
