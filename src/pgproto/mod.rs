@@ -2,12 +2,19 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const PROTOCOL_VERSION_3: i32 = 196608;
 const SSL_REQUEST_CODE: i32 = 80877103;
+const CANCEL_REQUEST_CODE: i32 = 80877102;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StartupParams {
     pub user: String,
     pub database: String,
     pub params: Vec<(String, String)>,
+}
+
+#[derive(Debug)]
+pub struct CancelRequest {
+    pub pid: i32,
+    pub secret_key: i32,
 }
 
 #[derive(Debug)]
@@ -24,7 +31,37 @@ pub enum AuthRequest {
 #[derive(Debug)]
 pub enum InitialMessage {
     SslRequest,
+    Cancel(CancelRequest),
     Startup(StartupParams),
+}
+
+/// Extended query protocol message types.
+#[allow(dead_code)]
+pub mod ext {
+    pub const PARSE: u8 = b'P';
+    pub const BIND: u8 = b'B';
+    pub const EXECUTE: u8 = b'E';
+    pub const DESCRIBE: u8 = b'D';
+    pub const CLOSE: u8 = b'C';
+    pub const SYNC: u8 = b'S';
+    pub const FLUSH: u8 = b'H';
+}
+
+/// Parse a Parse message and return the statement name.
+pub fn parse_statement_name(payload: &[u8]) -> &str {
+    let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+    std::str::from_utf8(&payload[..end]).unwrap_or("")
+}
+
+/// Parse a Close message and return the object type and name.
+pub fn parse_close_target(payload: &[u8]) -> (u8, &str) {
+    if payload.len() < 2 {
+        return (0, "");
+    }
+    let obj_type = payload[0];
+    let name_end = payload[1..].iter().position(|&b| b == 0).map(|p| p + 1).unwrap_or(payload.len());
+    let name = std::str::from_utf8(&payload[1..name_end]).unwrap_or("");
+    (obj_type, name)
 }
 
 pub async fn read_pg_message(
@@ -59,10 +96,18 @@ pub async fn read_initial_message(
         let mut code_buf = [0u8; 4];
         stream.read_exact(&mut code_buf).await?;
         let code = i32::from_be_bytes(code_buf);
-        if code == SSL_REQUEST_CODE {
-            return Ok(InitialMessage::SslRequest);
+        match code {
+            SSL_REQUEST_CODE => return Ok(InitialMessage::SslRequest),
+            CANCEL_REQUEST_CODE => {
+                // CancelRequest payload is pid (4) + secret_key (4)
+                let mut cancel_buf = [0u8; 8];
+                stream.read_exact(&mut cancel_buf).await?;
+                let pid = i32::from_be_bytes(cancel_buf[..4].try_into().unwrap());
+                let secret_key = i32::from_be_bytes(cancel_buf[4..].try_into().unwrap());
+                return Ok(InitialMessage::Cancel(CancelRequest { pid, secret_key }));
+            }
+            _ => anyhow::bail!("unknown protocol message: len={} code={}", len, code),
         }
-        anyhow::bail!("unknown protocol message: len={} code={}", len, code);
     }
 
     // Startup message: len includes itself (4) + protocol (4) + params
@@ -215,10 +260,18 @@ pub async fn send_ssl_accept(
     Ok(())
 }
 
+pub async fn send_ssl_reject(
+    stream: &mut (impl AsyncWrite + Unpin),
+) -> anyhow::Result<()> {
+    stream.write_all(b"N").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 pub async fn ssl_request(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
 ) -> anyhow::Result<bool> {
-    let msg = [0u8, 0, 0, 8, 4, 210, 44, 143]; // int32 8, int32 80877103
+    let msg = [0u8, 0, 0, 8, 4, 210, 22, 47];
     stream.write_all(&msg).await?;
     stream.flush().await?;
 

@@ -45,18 +45,73 @@ type ClientStream = ServerStream;
 // ── Per-client handler ──────────────────────────────────────────────
 
 async fn handle_client(
-    raw_client: TcpStream,
+    mut raw_client: TcpStream,
     peer: SocketAddr,
     config: &Config,
     pool: Arc<PoolManager>,
     token_cache: Option<&Arc<TokenCache>>,
 ) -> anyhow::Result<()> {
-    // 1. Client TLS upgrade (with optional client cert request)
-    let mut client = upgrade_client_tls(raw_client, config).await?;
+    // 0. Read initial message once — Cancel, SSLRequest, or Startup
+    let mut initial = pgproto::read_initial_message(&mut raw_client).await?;
+
+    // Cancel requests come on their own plain connection; forward and close.
+    if let pgproto::InitialMessage::Cancel(cancel) = &initial {
+        tracing::debug!("cancel request from {} (pid={} key={})", peer, cancel.pid, cancel.secret_key);
+        forward_cancel(config, cancel).await;
+        return Ok(());
+    }
+
+    // Determine if we need TLS and pre-save startup params before consuming initial
+    let mut pre_parsed_startup = match &initial {
+        pgproto::InitialMessage::Startup(s) => Some(s.clone()),
+        _ => None,
+    };
+
+    // 1. TLS upgrade — loops to handle SSLRequest with TLS disabled
+    let mut client = loop {
+        match initial {
+            pgproto::InitialMessage::SslRequest => {
+                let client_tls = config.tls.as_ref().is_some_and(|t| t.enabled);
+                if !client_tls {
+                    pgproto::send_ssl_reject(&mut raw_client).await?;
+                    initial = pgproto::read_initial_message(&mut raw_client).await?;
+                    pre_parsed_startup = match &initial {
+                        pgproto::InitialMessage::Startup(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    continue;
+                }
+                let tls_config = config.tls.as_ref().unwrap();
+                let client_ca = config.client_auth.client_ca.as_deref();
+                let cipher_config = (tls_config.ciphers.is_some() || tls_config.min_protocol_version.is_some())
+                    .then(|| tls::TlsCipherConfig {
+                        ciphers: tls_config.ciphers.clone(),
+                        min_protocol_version: tls_config.min_protocol_version.clone(),
+                    });
+                pgproto::send_ssl_accept(&mut raw_client).await?;
+                let tls_stream = tls::tls_accept(
+                    raw_client,
+                    &tls_config.cert_path,
+                    &tls_config.key_path,
+                    client_ca,
+                    cipher_config.as_ref(),
+                ).await?;
+                break ClientStream::Tls(tls_stream);
+            }
+            pgproto::InitialMessage::Startup(_) => {
+                break ClientStream::Plain(raw_client);
+            }
+            _ => anyhow::bail!("unexpected initial message"),
+        }
+    };
+
+    // 2. Extract startup params (pre-parsed for Startup, read from stream for SslRequest)
+    let startup: pgproto::StartupParams = match pre_parsed_startup {
+        Some(s) => s,
+        None => read_client_startup(&mut client).await?,
+    };
     let client_cert_present = client_cert_was_present(&client);
 
-    // 2. Read startup from client
-    let startup = read_client_startup(&mut client).await?;
     tracing::info!(
         "client connecting as user={} db={}",
         startup.user, startup.database
@@ -81,15 +136,15 @@ async fn handle_client(
     };
 
     // 5. Try idle pooled connection
-    if let Some(backend) = pool.try_acquire_idle(&pool_key).await {
+    if let Some((backend, born_at)) = pool.try_acquire_idle(&pool_key).await {
         tracing::debug!("using idle backend from pool");
         send_fake_ready(&mut client).await?;
         match config.pool.mode {
             crate::config::PoolMode::Session => {
-                relay_and_release(client, backend, &pool_key, &pool).await;
+                relay_and_release(client, backend, &pool_key, &pool, config, born_at).await;
             }
             crate::config::PoolMode::Transaction => {
-                transaction_loop(client, Some(backend), &pool_key, &pool, config, token_cache).await;
+                transaction_loop(client, Some((backend, born_at)), &pool_key, &pool, config, token_cache).await;
             }
         }
         spawn_warmup(&pool, &pool_key, config, token_cache).await;
@@ -100,7 +155,7 @@ async fn handle_client(
     if !pool.reserve(&pool_key).await {
         anyhow::bail!("connection pool exhausted");
     }
-    let backend = match create_backend(config, &pool_key, token_cache).await {
+    let (backend, born_at) = match create_backend(config, &pool_key, token_cache).await {
         Ok(b) => b,
         Err(e) => {
             pool.cancel_reservation(&pool_key).await;
@@ -108,12 +163,14 @@ async fn handle_client(
         }
     };
 
+    send_fake_ready(&mut client).await?;
+
     match config.pool.mode {
         crate::config::PoolMode::Session => {
-            relay_and_release(client, backend, &pool_key, &pool).await;
+            relay_and_release(client, backend, &pool_key, &pool, config, born_at).await;
         }
         crate::config::PoolMode::Transaction => {
-            transaction_loop(client, Some(backend), &pool_key, &pool, config, token_cache).await;
+            transaction_loop(client, Some((backend, born_at)), &pool_key, &pool, config, token_cache).await;
         }
     }
 
@@ -123,27 +180,20 @@ async fn handle_client(
 
 // ── Client TLS ──────────────────────────────────────────────────────
 
-async fn upgrade_client_tls(
-    mut stream: TcpStream,
-    config: &Config,
-) -> anyhow::Result<ClientStream> {
-    let client_tls = config.tls.as_ref().is_some_and(|t| t.enabled);
-    if !client_tls {
-        return Ok(ClientStream::Plain(stream));
-    }
-    let tls_config = config.tls.as_ref().unwrap();
-    let client_ca = config.client_auth.client_ca.as_deref();
-    let initial = pgproto::read_initial_message(&mut stream).await?;
-    match initial {
-        pgproto::InitialMessage::SslRequest => {
-            pgproto::send_ssl_accept(&mut stream).await?;
-            let tls_stream =
-                tls::tls_accept(stream, &tls_config.cert_path, &tls_config.key_path, client_ca).await?;
-            Ok(ClientStream::Tls(tls_stream))
-        }
-        pgproto::InitialMessage::Startup(_) => {
-            anyhow::bail!("client sent startup without SSLRequest, but TLS is required");
-        }
+async fn forward_cancel(config: &Config, cancel: &pgproto::CancelRequest) {
+    let target = config.target_addr();
+    if let Ok(mut stream) = TcpStream::connect(&target).await {
+        let msg = [
+            0u8, 0, 0, 16,   // len=16
+            4, 210, 22, 46,  // CancelRequest code = 80877102
+        ];
+        let pid_bytes = cancel.pid.to_be_bytes();
+        let secret_bytes = cancel.secret_key.to_be_bytes();
+        let mut full = msg.to_vec();
+        full.extend_from_slice(&pid_bytes);
+        full.extend_from_slice(&secret_bytes);
+        let _ = stream.write_all(&full).await;
+        let _ = stream.flush().await;
     }
 }
 
@@ -164,6 +214,9 @@ async fn read_client_startup(client: &mut ClientStream) -> anyhow::Result<pgprot
         pgproto::InitialMessage::Startup(s) => Ok(s),
         pgproto::InitialMessage::SslRequest => {
             anyhow::bail!("unexpected SSLRequest after TLS handshake");
+        }
+        pgproto::InitialMessage::Cancel(_) => {
+            anyhow::bail!("unexpected cancel request after TLS handshake");
         }
     }
 }
@@ -473,17 +526,33 @@ async fn create_backend(
     config: &Config,
     pool_key: &PoolKey,
     token_cache: Option<&Arc<TokenCache>>,
-) -> anyhow::Result<ServerStream> {
-    let backend_tls = config.tls.as_ref().is_some_and(|t| t.enabled && t.connect_with_tls);
-
-    let mut raw = TcpStream::connect(config.target_addr()).await?;
+) -> anyhow::Result<(ServerStream, std::time::Instant)> {
+    let born_at = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(
+        if config.pool.server_connect_timeout_secs > 0 {
+            config.pool.server_connect_timeout_secs
+        } else {
+            15
+        },
+    );
+    let mut raw = tokio::time::timeout(timeout, TcpStream::connect(config.target_addr()))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timeout to {}", config.target_addr()))??;
+    let backend_tls = config.tls.as_ref().is_some_and(|t| t.connect_with_tls);
     let mut backend: ServerStream = if backend_tls {
         let host = config.pool.target_host.clone();
         let accepted = pgproto::ssl_request(&mut raw).await?;
         if !accepted {
             anyhow::bail!("backend does not support TLS");
         }
-        let tls_stream = tls::tls_connect(raw, &host).await?;
+        let tls_config = config.tls.as_ref().unwrap();
+        let cipher_config = (tls_config.ciphers.is_some() || tls_config.min_protocol_version.is_some())
+            .then(|| tls::TlsCipherConfig {
+                ciphers: tls_config.ciphers.clone(),
+                min_protocol_version: tls_config.min_protocol_version.clone(),
+            });
+        let ca_path = tls_config.backend_ca_path.as_deref();
+        let tls_stream = tls::tls_connect(raw, &host, cipher_config.as_ref(), ca_path).await?;
         ServerStream::Tls(tls_stream)
     } else {
         ServerStream::Plain(raw)
@@ -570,7 +639,7 @@ async fn create_backend(
         }
     }
 
-    Ok(backend)
+    Ok((backend, born_at))
 }
 
 /// Client-side SCRAM-SHA-256 exchange for IAM backend auth.
@@ -647,13 +716,16 @@ async fn do_scram_client_auth(
 
 async fn transaction_loop(
     mut client: ClientStream,
-    initial_server: Option<ServerStream>,
+    initial_server: Option<(ServerStream, std::time::Instant)>,
     pool_key: &PoolKey,
     pool: &Arc<PoolManager>,
     config: &Config,
     token_cache: Option<&Arc<TokenCache>>,
 ) {
-    let mut server: Option<ServerStream> = initial_server;
+    let mut server: Option<(ServerStream, std::time::Instant)> = initial_server;
+    let mut prepared: Vec<String> = Vec::new();
+    let mut in_transaction = false;
+    let mut tx_start = std::time::Instant::now();
 
     loop {
         if server.is_none() {
@@ -664,35 +736,99 @@ async fn transaction_loop(
             break;
         }
 
-        let server_borrow: *mut ServerStream =
-            server.as_mut().map(|s| s as *mut ServerStream).unwrap();
-        let server_ref = unsafe { &mut *server_borrow };
+        let server_ref = server.as_mut().map(|(s, _b)| {
+            let ptr: *mut ServerStream = s;
+            ptr
+        }).unwrap();
+        let server_ref = unsafe { &mut *server_ref };
 
         enum Event {
             ClientMsg(Option<(u8, Vec<u8>)>),
             ServerMsg(Option<(u8, Vec<u8>)>),
+            Timeout,
         }
 
+        // Build select with timeouts — do in a block to drop futures after select
         let event = {
             let client_fut = pgproto::read_pg_message(&mut client);
             let server_fut = pgproto::read_pg_message(server_ref);
-            tokio::select! {
-                msg = client_fut => Event::ClientMsg(msg.ok().flatten()),
-                msg = server_fut => Event::ServerMsg(msg.ok().flatten()),
+
+            let client_idle = if config.pool.client_idle_timeout_secs > 0 {
+                std::time::Duration::from_secs(config.pool.client_idle_timeout_secs)
+            } else {
+                std::time::Duration::MAX
+            };
+            let query_wait = if config.pool.query_wait_timeout_secs > 0 {
+                std::time::Duration::from_secs(config.pool.query_wait_timeout_secs)
+            } else {
+                std::time::Duration::MAX
+            };
+
+            if in_transaction && config.pool.transaction_timeout_secs > 0 {
+                let remaining = std::time::Duration::from_secs(config.pool.transaction_timeout_secs)
+                    .saturating_sub(tx_start.elapsed());
+                if remaining.is_zero() {
+                    Event::Timeout
+                } else {
+                    tokio::select! {
+                        msg = client_fut => Event::ClientMsg(msg.ok().flatten()),
+                        msg = server_fut => Event::ServerMsg(msg.ok().flatten()),
+                        _ = tokio::time::sleep(remaining) => Event::Timeout,
+                        _ = tokio::time::sleep(client_idle) => Event::Timeout,
+                        _ = tokio::time::sleep(query_wait) => Event::Timeout,
+                    }
+                }
+            } else {
+                tokio::select! {
+                    msg = client_fut => Event::ClientMsg(msg.ok().flatten()),
+                    msg = server_fut => Event::ServerMsg(msg.ok().flatten()),
+                    _ = tokio::time::sleep(client_idle) => Event::Timeout,
+                    _ = tokio::time::sleep(query_wait) => Event::Timeout,
+                }
             }
         };
 
         match event {
+            Event::Timeout => {
+                tracing::warn!("timeout triggered for {}@{}, closing", pool_key.db_user, pool_key.dbname);
+                break;
+            }
             Event::ClientMsg(None) => break,
             Event::ClientMsg(Some((b'X', _))) => {
-                if let Some(ref mut s) = server {
+                if let Some((ref mut s, _)) = server {
                     let _ = pgproto::write_raw_message(s, b'X', &[]).await;
                     let _ = s.flush().await;
                 }
                 break;
             }
             Event::ClientMsg(Some((t, p))) => {
-                if let Some(ref mut s) = server {
+                // Track extended query messages
+                match t {
+                    pgproto::ext::PARSE => {
+                        let name = pgproto::parse_statement_name(&p).to_string();
+                        if !name.is_empty() {
+                            prepared.push(name);
+                        }
+                    }
+                    pgproto::ext::CLOSE => {
+                        let (_obj_type, name) = pgproto::parse_close_target(&p);
+                        if !name.is_empty() {
+                            prepared.retain(|s| s != name);
+                        }
+                    }
+                    b'Q' => {
+                        // Simple query — starts a transaction if it contains BEGIN
+                        let query_str = String::from_utf8_lossy(&p);
+                        if query_str.to_uppercase().contains("BEGIN")
+                            || query_str.to_uppercase().contains("START TRANSACTION")
+                        {
+                            in_transaction = true;
+                            tx_start = std::time::Instant::now();
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some((ref mut s, _)) = server {
                     if pgproto::write_raw_message(s, t, &p).await.is_err()
                         || s.flush().await.is_err()
                     {
@@ -707,21 +843,69 @@ async fn transaction_loop(
                 {
                     break;
                 }
-                if t == b'Z' && p.first() == Some(&b'I') {
-                    if let Some(ref mut s) = server {
-                        run_reset_query(s, config).await;
+                // Track transaction state
+                match t {
+                    b'Z' => {
+                        if p.first() == Some(&b'I') {
+                            // Idle — transaction complete, release server
+                            if let Some((ref mut s, _)) = server {
+                                if run_reset_query(s, config).await {
+                                    // DEALLOCATE tracked prepared statements
+                                    for stmt_name in &prepared {
+                                        let dealloc = format!("DEALLOCATE \"{}\"", stmt_name);
+                                        let mut payload = dealloc.into_bytes();
+                                        payload.push(0);
+                                        let len = (payload.len() + 4) as i32;
+                                        let mut msg = vec![b'Q'];
+                                        msg.extend_from_slice(&len.to_be_bytes());
+                                        msg.extend_from_slice(&payload);
+                                        let _ = s.write_all(&msg).await;
+                                        let _ = s.flush().await;
+                                        // Drain until ReadyForQuery
+                                        loop {
+                                            match pgproto::read_pg_message(s).await {
+                                                Ok(Some((b'Z', _))) => break,
+                                                _ => break,
+                                            }
+                                        }
+                                    }
+                                    prepared.clear();
+                                    in_transaction = false;
+                                }
+                            }
+                            if let Some((released, born)) = server.take() {
+                                pool.release(pool_key, released, born).await;
+                            }
+                        } else if p.first() == Some(&b'T') {
+                            // In transaction
+                            in_transaction = true;
+                            tx_start = std::time::Instant::now();
+                        }
                     }
-                    if let Some(released) = server.take() {
-                        pool.release(pool_key, released).await;
+                    b'E' if !in_transaction => {
+                        // Error outside transaction — connection may need reset
+                        if let Some((ref mut s, _)) = server {
+                            if run_reset_query(s, config).await {
+                                if let Some((released, born)) = server.take() {
+                                    pool.release(pool_key, released, born).await;
+                                }
+                            } else {
+                                let _ = server.take();
+                            }
+                        } else {
+                            let _ = server.take();
+                        }
                     }
+                    _ => {}
                 }
             }
         }
     }
 
-    if let Some(mut s) = server.take() {
-        run_reset_query(&mut s, config).await;
-        pool.release(pool_key, s).await;
+    if let Some((mut s, born)) = server.take() {
+        if run_reset_query(&mut s, config).await {
+            pool.release(pool_key, s, born).await;
+        }
     }
 }
 
@@ -730,7 +914,7 @@ async fn acquire_backend(
     pool_key: &PoolKey,
     config: &Config,
     token_cache: Option<&Arc<TokenCache>>,
-) -> Option<ServerStream> {
+) -> Option<(ServerStream, std::time::Instant)> {
     if let Some(s) = pool.try_acquire_idle(pool_key).await {
         tracing::debug!("transaction_loop: acquired idle backend");
         return Some(s);
@@ -754,7 +938,7 @@ async fn acquire_backend(
 async fn run_reset_query(
     server: &mut (impl tokio::io::AsyncRead + AsyncWriteExt + Unpin),
     config: &Config,
-) {
+) -> bool {
     let reset_query = config.pool.server_reset_query.as_bytes();
     let mut payload = reset_query.to_vec();
     payload.push(0);
@@ -765,36 +949,43 @@ async fn run_reset_query(
 
     if let Err(e) = server.write_all(&msg).await {
         tracing::warn!("run_reset_query: write failed: {e}");
-        return;
+        return false;
     }
     if let Err(e) = server.flush().await {
         tracing::warn!("run_reset_query: flush failed: {e}");
-        return;
+        return false;
     }
 
     loop {
         match pgproto::read_pg_message(server).await {
             Ok(Some((type_byte, _))) => {
                 if type_byte == b'Z' {
-                    break;
+                    return true;
                 }
             }
-            _ => break,
+            _ => return false,
         }
     }
 }
 
 // ── Session pooling relay ───────────────────────────────────────────
 
-async fn relay_and_release(
+ async fn relay_and_release(
     mut client: ClientStream,
     mut server: ServerStream,
     pool_key: &PoolKey,
     pool: &Arc<PoolManager>,
+    config: &Config,
+    born_at: std::time::Instant,
 ) {
     let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
-    pool.release(pool_key, server).await;
-    tracing::debug!("released backend to pool");
+
+    if run_reset_query(&mut server, config).await {
+        pool.release(pool_key, server, born_at).await;
+        tracing::debug!("released backend to pool");
+    } else {
+        tracing::warn!("dropping dead backend");
+    }
 }
 
 // ── Pool warm-up ────────────────────────────────────────────────────
@@ -822,8 +1013,8 @@ async fn spawn_warmup(
                 return;
             }
             match create_backend(&config, &key, token_cache.as_ref()).await {
-                Ok(stream) => {
-                    pool.release(&key, stream).await;
+                Ok((stream, born_at)) => {
+                    pool.release(&key, stream, born_at).await;
                     tracing::debug!("warm-up connection created for {}@{}", key.db_user, key.dbname);
                 }
                 Err(e) => {

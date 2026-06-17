@@ -88,7 +88,7 @@ Client ──[trust|password|SCRAM|cert|PAM|LDAP|HBA]──▶ pgb-iam ──[IA
 |---|---|---|---|
 | Client TLS | ✅ Full | ✅ | rustls accept with optional client CA |
 | Server TLS | ✅ Full | ⚠️ | `connect_with_tls: bool` only |
-| Cipher / protocol selection | ✅ | ❌ | Uses rustls defaults |
+| Cipher / protocol selection | ✅ | ✅ | Configurable via `ciphers` and `min_protocol_version` |
 | Client cert validation | ✅ | ✅ | `client_ca` → `WebPkiClientVerifier` |
 
 ### Protocol
@@ -97,9 +97,9 @@ Client ──[trust|password|SCRAM|cert|PAM|LDAP|HBA]──▶ pgb-iam ──[IA
 |---|---|---|---|
 | Wire protocol (startup, auth, relay) | ✅ | ✅ | Full basic flow |
 | SSLRequest / TLS upgrade | ✅ | ✅ | rustls accept/connect |
-| Extended query protocol | ✅ | ⚠️ | Relayed as opaque bytes |
-| Prepared statement tracking | ✅ | ❌ | Not tracked |
-| Cancel request | ✅ | ❌ | Not parsed |
+| Extended query protocol | ✅ | ⚠️ | Message types defined; relayed as opaque bytes |
+| Prepared statement tracking | ✅ | ✅ | Tracked per connection; DEALLOCATE on release |
+| Cancel request | ✅ | ✅ | Parsed and forwarded on separate backend connection |
 | Replication protocol | ✅ | ❌ | Not implemented |
 
 ### Timeouts
@@ -107,12 +107,12 @@ Client ──[trust|password|SCRAM|cert|PAM|LDAP|HBA]──▶ pgb-iam ──[IA
 | Feature | PgBouncer | pgb-iam | Notes |
 |---|---|---|---|
 | `server_idle_timeout` | ✅ | ✅ | `idle_timeout_secs` in config |
-| `server_lifetime` | ✅ | ❌ | No max connection age |
-| `server_connect_timeout` | ✅ | ❌ | No connect deadline |
+| `server_lifetime` | ✅ | ✅ | `server_lifetime_secs` — enforced on pool release |
+| `server_connect_timeout` | ✅ | ✅ | `server_connect_timeout_secs` — in `create_backend` |
 | `query_timeout` | ✅ | ❌ | Not implemented |
-| `client_idle_timeout` | ✅ | ❌ | Not implemented |
-| `transaction_timeout` | ✅ | ❌ | Not implemented |
-| `query_wait_timeout` | ✅ | ❌ | Not implemented |
+| `client_idle_timeout` | ✅ | ✅ | Enforced in `transaction_loop` |
+| `transaction_timeout` | ✅ | ✅ | Enforced in `transaction_loop` |
+| `query_wait_timeout` | ✅ | ✅ | Enforced in `transaction_loop` |
 
 ### Admin & Monitoring
 
@@ -201,6 +201,11 @@ max_size = 10
 min_size = 2
 reserve_size = 2
 idle_timeout_secs = 300
+server_lifetime_secs = 3600
+server_connect_timeout_secs = 15
+client_idle_timeout_secs = 0
+transaction_timeout_secs = 0
+query_wait_timeout_secs = 0
 target_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
 target_port = 5432
 dbname = "postgres"
@@ -265,6 +270,8 @@ enabled = false
 cert_path = "server.crt"
 key_path = "server.key"
 connect_with_tls = false
+# ciphers = ["TLS13_AES_256_GCM_SHA384", "TLS13_AES_128_GCM_SHA256"]
+# min_protocol_version = "TLSv1.2"
 
 [iam]
 provider = "aws"            # aws | gcp | none

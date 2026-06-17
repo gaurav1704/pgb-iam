@@ -103,6 +103,7 @@ pub enum PoolStrategy {
 struct IdleConn {
     stream: ServerStream,
     parked_since: Instant,
+    born_at: Instant,
 }
 
 struct PoolInner {
@@ -110,32 +111,10 @@ struct PoolInner {
     active: usize,
     limits: PoolLimits,
     idle_timeout: Duration,
+    server_lifetime: Duration,
 }
 
 impl PoolInner {
-    fn acquire(&mut self) -> Option<ServerStream> {
-        while let Some(c) = match self.limits.strategy {
-            PoolStrategy::Lifo => self.idle.pop_back(),
-            PoolStrategy::Fifo => self.idle.pop_front(),
-        } {
-            if c.parked_since.elapsed() < self.idle_timeout {
-                self.active += 1;
-                return Some(c.stream);
-            }
-        }
-        None
-    }
-
-    fn release(&mut self, stream: ServerStream) {
-        if self.idle.len() < self.limits.max_size {
-            self.idle.push_back(IdleConn {
-                stream,
-                parked_since: Instant::now(),
-            });
-        }
-        self.active = self.active.saturating_sub(1);
-    }
-
     fn can_create(&self) -> bool {
         let hard_limit = self.limits.max_size + self.limits.reserve_size;
         self.active + self.idle.len() < hard_limit
@@ -157,6 +136,7 @@ pub struct PoolManager {
     pools: Mutex<HashMap<PoolKey, PoolInner>>,
     global_limits: PoolLimits,
     default_timeout: Duration,
+    default_lifetime: Duration,
     database_limits: HashMap<String, PoolLimits>,
     user_limits: HashMap<String, PoolLimits>,
 }
@@ -209,16 +189,33 @@ impl PoolManager {
             pools: Mutex::new(HashMap::new()),
             global_limits,
             default_timeout: Duration::from_secs(config.idle_timeout_secs),
+            default_lifetime: Duration::from_secs(config.server_lifetime_secs),
             database_limits,
             user_limits,
         }
     }
 
-    /// Try to acquire an idle connection.
-    pub async fn try_acquire_idle(&self, key: &PoolKey) -> Option<ServerStream> {
+    /// Try to acquire an idle connection. Returns (stream, born_at).
+    pub async fn try_acquire_idle(&self, key: &PoolKey) -> Option<(ServerStream, Instant)> {
         let mut pools = self.pools.lock().await;
         let entry = pools.get_mut(key)?;
-        entry.acquire()
+        let c = loop {
+            match match entry.limits.strategy {
+                PoolStrategy::Lifo => entry.idle.pop_back(),
+                PoolStrategy::Fifo => entry.idle.pop_front(),
+            } {
+                Some(c) => {
+                    let expired = c.parked_since.elapsed() >= entry.idle_timeout
+                        || c.born_at.elapsed() >= entry.server_lifetime;
+                    if !expired {
+                        entry.active += 1;
+                        break Some(c);
+                    }
+                }
+                None => break None,
+            }
+        };
+        c.map(|c| (c.stream, c.born_at))
     }
 
     /// Reserve capacity (increments active count). Returns false if full.
@@ -233,10 +230,18 @@ impl PoolManager {
     }
 
     /// Release a connection back to the pool.
-    pub async fn release(&self, key: &PoolKey, stream: ServerStream) {
+    pub async fn release(&self, key: &PoolKey, stream: ServerStream, born_at: Instant) {
         let mut pools = self.pools.lock().await;
         let entry = self.entry_or_create(&mut *pools, key);
-        entry.release(stream);
+        let expired = born_at.elapsed() >= entry.server_lifetime;
+        if !expired && entry.idle.len() < entry.limits.max_size {
+            entry.idle.push_back(IdleConn {
+                stream,
+                parked_since: Instant::now(),
+                born_at,
+            });
+        }
+        entry.active = entry.active.saturating_sub(1);
     }
 
     /// Cancel a reservation.
@@ -324,6 +329,7 @@ impl PoolManager {
     ) -> &'a mut PoolInner {
         let limits = self.resolve_limits(key);
         let timeout = self.default_timeout;
+        let lifetime = self.default_lifetime;
         pools.entry(key.clone()).or_insert_with(|| {
             tracing::info!(
                 "creating pool for {}@{} (max={}, min={}, reserve={}, strategy={:?})",
@@ -339,6 +345,7 @@ impl PoolManager {
                 active: 0,
                 limits,
                 idle_timeout: timeout,
+                server_lifetime: lifetime,
             }
         })
     }

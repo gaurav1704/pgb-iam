@@ -61,6 +61,19 @@ pub struct PoolConfig {
     #[serde(default)]
     pub strategy: PoolStrategy,
     pub idle_timeout_secs: u64,
+    #[serde(default = "default_server_lifetime")]
+    pub server_lifetime_secs: u64,
+    #[serde(default = "default_server_connect_timeout")]
+    pub server_connect_timeout_secs: u64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub query_timeout_secs: u64,
+    #[serde(default)]
+    pub client_idle_timeout_secs: u64,
+    #[serde(default)]
+    pub transaction_timeout_secs: u64,
+    #[serde(default)]
+    pub query_wait_timeout_secs: u64,
     pub target_host: String,
     pub target_port: u16,
     pub dbname: String,
@@ -77,6 +90,14 @@ pub struct PoolConfig {
 
 fn default_reset_query() -> String {
     "DISCARD ALL".to_string()
+}
+
+fn default_server_lifetime() -> u64 {
+    3600
+}
+
+fn default_server_connect_timeout() -> u64 {
+    15
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -153,6 +174,12 @@ pub struct TlsConfig {
     pub cert_path: String,
     pub key_path: String,
     pub connect_with_tls: bool,
+    #[serde(default)]
+    pub backend_ca_path: Option<String>,
+    #[serde(default)]
+    pub ciphers: Option<Vec<String>>,
+    #[serde(default)]
+    pub min_protocol_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

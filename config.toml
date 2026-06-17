@@ -11,13 +11,13 @@ addr = "127.0.0.1"
 port = 6432
 
 [pool]
-mode = "session"          # "session" | "transaction"
+mode = "transaction"      # "session" | "transaction"
 strategy = "lifo"         # "lifo" | "fifo"
 max_size = 10
 min_size = 2              # background warm-up connections
 reserve_size = 2          # extra headroom beyond max_size
 idle_timeout_secs = 300
-target_host = "localhost"
+target_host = "database-1-instance-1.cc7akcmcsmso.us-east-1.rds.amazonaws.com"
 target_port = 5432
 dbname = "postgres"
 db_user = "postgres"      # the user pgb-iam connects AS to PostgreSQL
@@ -33,8 +33,8 @@ server_reset_query = "DISCARD ALL"
 "readonly" = { max_size = 5 }
 
 # ── Auth method 1: trust (no password) ────────────────────────────────
-#[client_auth]
-#type = "trust"
+[client_auth]
+type = "trust"
 
 # ── Auth method 2: password (cleartext) ───────────────────────────────
 #[client_auth]
@@ -116,11 +116,11 @@ server_reset_query = "DISCARD ALL"
 
 # ── IAM (optional) — authenticates pgb-iam → PostgreSQL backends ──────
 [iam]
-provider = "aws"              # "aws" | "gcp" | "none"
+provider = "aws"
 region = "us-east-1"
-instance_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
+instance_host = "database-1-instance-1.cc7akcmcsmso.us-east-1.rds.amazonaws.com"
 instance_port = 5432
-db_user = "iam_user"          # the IAM user for backend connections
+db_user = "postgres"
 # Note: pool.db_user (above) must match this for IAM auth to trigger.
 
 # ── Metrics (Prometheus) ──────────────────────────────────────────────
@@ -146,4 +146,7 @@ timeout_secs = 5
 enabled = false
 cert_path = "server.crt"
 key_path = "server.key"
-connect_with_tls = false       # connect to PostgreSQL with TLS?
+connect_with_tls = true       # connect to PostgreSQL with TLS? (required for RDS IAM)
+backend_ca_path = "./global-bundle.pem"
+# ciphers = ["TLS13_AES_256_GCM_SHA384", "TLS13_AES_128_GCM_SHA256"]
+# min_protocol_version = "TLSv1.2"
