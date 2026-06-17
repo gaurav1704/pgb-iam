@@ -69,7 +69,7 @@ Client ──[trust|password|SCRAM|cert|PAM|LDAP|HBA]──▶ pgb-iam ──[IA
 ### Authentication
 
 | Feature | PgBouncer | pgb-iam | Notes |
-|---|---|---|---|---|
+|---|---|---|---|
 | Cleartext password | ✅ | ✅ | IAM token sent as cleartext |
 | MD5 password | ✅ | ✅ | IAM token MD5-hashed with server salt |
 | SCRAM-SHA-256 | ✅ | ✅ | Full SASL exchange (server + client) |
@@ -85,7 +85,7 @@ Client ──[trust|password|SCRAM|cert|PAM|LDAP|HBA]──▶ pgb-iam ──[IA
 ### TLS
 
 | Feature | PgBouncer | pgb-iam | Notes |
-|---|---|---|---|---|
+|---|---|---|---|
 | Client TLS | ✅ Full | ✅ | rustls accept with optional client CA |
 | Server TLS | ✅ Full | ⚠️ | `connect_with_tls: bool` only |
 | Cipher / protocol selection | ✅ | ❌ | Uses rustls defaults |
