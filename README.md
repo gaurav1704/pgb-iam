@@ -56,7 +56,7 @@ Client ──[trust/password]──▶ pgb-iam ──[IAM token]──▶ Postgr
 ### Pooling
 
 | Feature | PgBouncer | pgb-iam | Notes |
-|---|---|---|---|---|
+|---|---|---|---|
 | Session pooling | ✅ | ✅ | Server assigned for client lifetime |
 | Transaction pooling | ✅ | ✅ | Server released on ReadyForQuery('I') |
 | Statement pooling | ✅ | ❌ | Not implemented |
@@ -127,7 +127,7 @@ Client ──[trust/password]──▶ pgb-iam ──[IAM token]──▶ Postgr
 ### Configuration
 
 | Feature | PgBouncer | pgb-iam | Notes |
-|---|---|---|---|---|
+|---|---|---|---|
 | Config format | INI | TOML | Cleaner format |
 | Per-database settings | ✅ | ✅ | `[pool.database_limits]` table |
 | Per-user settings | ✅ | ✅ | `[pool.user_limits]` table |
