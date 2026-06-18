@@ -1,0 +1,6 @@
+target/
+.git/
+.gitignore
+README.md
+*.pem
+!global-bundle.pem
