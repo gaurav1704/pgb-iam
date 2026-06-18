@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use tracing;
 
 use crate::config::HealthCheckConfig;
 
@@ -58,17 +57,17 @@ impl HealthChecker {
                 let _ = stream;
                 status.healthy = true;
                 status.last_error = None;
-                tracing::info!("health check passed for {}", self.target_addr);
+                crate::log_event!(INFO, crate::log::HEALTH, crate::log::CHECK, "health check passed for {}", self.target_addr);
             }
             Ok(Err(e)) => {
                 status.healthy = false;
                 status.last_error = Some(format!("connection failed: {}", e));
-                tracing::warn!("health check failed for {}: {}", self.target_addr, e);
+                crate::log_event!(WARN, crate::log::HEALTH, crate::log::ERROR, "health check failed for {}: {}", self.target_addr, e);
             }
             Err(_) => {
                 status.healthy = false;
                 status.last_error = Some("connection timed out".to_string());
-                tracing::warn!("health check timed out for {}", self.target_addr);
+                crate::log_event!(WARN, crate::log::HEALTH, crate::log::TIMEOUT, "health check timed out for {}", self.target_addr);
             }
         }
     }

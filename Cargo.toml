@@ -10,7 +10,7 @@ serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
 aws-config = "1"
 aws-sdk-rds = "1"
@@ -32,3 +32,4 @@ ipnetwork = "0.20"
 libc = "0.2"
 chrono = { version = "0.4", default-features = false }
 aws-credential-types = "1.2.14"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

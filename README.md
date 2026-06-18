@@ -264,99 +264,253 @@ src/
 └── metrics/         Prometheus endpoint (GET /metrics)
 ```
 
-## Configuration
+## Configuration Reference
+
+### `[listen]` — TCP bind address
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `addr` | string | `"127.0.0.1"` | IP address to bind |
+| `port` | integer | `6432` | TCP port to listen on |
+
+---
+
+### `[pool]` — Connection pool behavior
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `mode` | enum | `"session"` | `"session"` — backend held for client lifetime; `"transaction"` — released after each transaction |
+| `strategy` | enum | `"lifo"` | `"lifo"` — most recently used recycled first; `"fifo"` — oldest first |
+| `max_size` | integer | **required** | Maximum backend connections in pool (excluding reserve) |
+| `min_size` | integer | `0` | Background warm-up target — pool spawns this many connections after first relay |
+| `reserve_size` | integer | `0` | Extra capacity beyond `max_size` for burst traffic; uses a separate semaphore |
+| `idle_timeout_secs` | integer | `300` | Idle connection removed from pool after this many seconds |
+| `server_lifetime_secs` | integer | `3600` | Connection dropped after this many seconds from creation (enforced on release) |
+| `server_connect_timeout_secs` | integer | `15` | Max seconds to wait for TCP + TLS + PostgreSQL handshake per backend |
+| `client_idle_timeout_secs` | integer | `0` | Max seconds a client can stay idle without a transaction (0 = disabled) |
+| `transaction_timeout_secs` | integer | `0` | Max seconds a single transaction can run (0 = disabled) |
+| `query_wait_timeout_secs` | integer | `0` | Max seconds a query can wait for a backend connection (0 = disabled) |
+| `target_host` | string | **required** | PostgreSQL hostname or IP |
+| `target_port` | integer | **required** | PostgreSQL port |
+| `dbname` | string | **required** | Default database name |
+| `db_user` | string | **required** | PostgreSQL user that pgb-iam connects as (used for IAM auth) |
+| `server_reset_query` | string | `"DISCARD ALL"` | SQL sent to reset backend state before returning to pool |
+| `client_max` | integer | `0` | Maximum concurrent client connections (0 = unlimited) |
+
+**Timeout behavior**: A value of `0` disables the timeout (equivalent to infinite).
+
+---
+
+### `[pool.database_limits]` — Per-database pool limits
+
+Overrides the global `max_size`, `min_size`, and `reserve_size` for specific databases:
 
 ```toml
-[listen]
-addr = "127.0.0.1"
-port = 6432
-
-[pool]
-mode = "session"            # session | transaction
-strategy = "lifo"           # lifo (default) | fifo
-max_size = 10
-min_size = 2
-reserve_size = 2
-idle_timeout_secs = 300
-server_lifetime_secs = 3600
-server_connect_timeout_secs = 15
-client_idle_timeout_secs = 0
-transaction_timeout_secs = 0
-query_wait_timeout_secs = 0
-target_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
-target_port = 5432
-dbname = "postgres"
-db_user = "iam_user"
-
 [pool.database_limits]
-"postgres" = { max_size = 20, min_size = 1 }
-
-[pool.user_limits]
-"admin" = { max_size = 15, reserve_size = 5 }
-
-[client_auth]
-# type = "trust"             # trust | password | scram-sha-256 | cert | pam | ldap | hba | auth_query
-# password = "mypassword"    # required for password / scram-sha-256
-# client_ca = "ca.pem"       # required for cert auth
-# pam_service = "pgb-iam"    # required for pam auth
-
-# For auth_query:
-# [client_auth.auth_query]
-# user = "pgb_iam_auth"
-# query = "SELECT passwd FROM pg_shadow WHERE usename = $1"
-
-# For LDAP:
-# [client_auth.ldap]
-# uri = "ldap://ldap.example.com"
-# bind_dn = "cn=admin,dc=example,dc=com"
-# bind_password = "admin_pass"
-# search_base = "dc=example,dc=com"
-# search_filter = "(uid=$1)"
-
-# For HBA (rules are evaluated in order, first match wins):
-# [[client_auth.hba_rules]]
-# type = "hostssl"
-# database = ["all"]
-# user = ["all"]
-# address = "0.0.0.0/0"
-# auth = "cert"
-# [[client_auth.hba_rules]]
-# type = "host"
-# database = ["mydb"]
-# user = ["admin"]
-# address = "10.0.0.0/8"
-# auth = "scram-sha-256"
-
-[metrics]
-enabled = true
-listen_addr = "127.0.0.1"
-listen_port = 9090
-
-[admin]
-enabled = true
-listen_addr = "127.0.0.1"
-listen_port = 9091
-
-[health_check]
-enabled = true
-interval_secs = 30
-timeout_secs = 5
-
-[tls]
-enabled = false
-cert_path = "server.crt"
-key_path = "server.key"
-connect_with_tls = false
-# ciphers = ["TLS13_AES_256_GCM_SHA384", "TLS13_AES_128_GCM_SHA256"]
-# min_protocol_version = "TLSv1.2"
-
-[iam]
-provider = "aws"            # aws | gcp | none
-region = "us-east-1"
-instance_host = "your-db.xxxxxx.us-east-1.rds.amazonaws.com"
-instance_port = 5432
-db_user = "iam_user"
+"postgres" = { max_size = 2, min_size = 1, reserve_size = 1 }
+"myapp" = { max_size = 50 }
 ```
+
+Any unset limit inherits the value from `[pool]`.
+
+---
+
+### `[pool.user_limits]` — Per-user pool limits
+
+Same structure as `database_limits` but limits connections for a specific `db_user`:
+
+```toml
+[pool.user_limits]
+"admin" = { max_size = 15 }
+"readonly" = { max_size = 5 }
+```
+
+---
+
+### `[client_auth]` — Client authentication
+
+Controls how pgb-iam verifies incoming client connections. Only one `[client_auth]` block is active at a time (unless using HBA, which dispatches per-connection).
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `type` | enum | **required** | Authentication method (see below) |
+| `password` | string | none | Static password for `password` / `scram-sha-256` methods |
+| `client_ca` | string | none | Path to CA PEM file for `cert` method (requires `[tls].enabled = true`) |
+| `pam_service` | string | `"pgb-iam"` | PAM service name for `pam` method |
+
+**`type` values:**
+
+| Value | Description |
+|---|---|
+| `"trust"` | Accept all connections without credentials |
+| `"password"` | Cleartext password — matched against `password` field or `[client_auth.auth_query]` |
+| `"scram-sha-256"` | Full SASL SCRAM-SHA-256 exchange |
+| `"cert"` | TLS client certificate validated against `client_ca` (requires client TLS) |
+| `"pam"` | Delegates to system PAM via `pam_service` |
+| `"ldap"` | LDAP bind + search (see `[client_auth.ldap]`) |
+| `"hba"` | Evaluates `[[client_auth.hba_rules]]` in order |
+| `"auth_query"` | Dynamic password lookup from PostgreSQL (see `[client_auth.auth_query]`) |
+
+---
+
+### `[client_auth.auth_query]` — Dynamic password lookup
+
+Required when `client_auth.type` is `"password"`, `"scram-sha-256"`, or `"hba"` and passwords come from the database:
+
+| Key | Type | Description |
+|---|---|---|
+| `user` | string | PostgreSQL user that pgb-iam connects as for the lookup |
+| `query` | string | SQL returning the password (e.g., `"SELECT passwd FROM pg_shadow WHERE usename = $1"`) |
+
+The `$1` placeholder is replaced with the client's username.
+
+---
+
+### `[client_auth.ldap]` — LDAP configuration
+
+Required when `client_auth.type` is `"ldap"`:
+
+| Key | Type | Description |
+|---|---|---|
+| `uri` | string | LDAP server URI (e.g., `"ldap://ldap.example.com"`) |
+| `bind_dn` | string | Admin bind DN |
+| `bind_password` | string | Admin bind password |
+| `search_base` | string | Base DN for user search |
+| `search_filter` | string | Filter with `$1` placeholder for client username (e.g., `"(uid=$1)"`) |
+
+---
+
+### `[[client_auth.hba_rules]]` — Host-based authentication rules
+
+Evaluated in order for each connection. The first matching rule determines the auth method. Required when `client_auth.type` is `"hba"`.
+
+| Key | Type | Description |
+|---|---|---|
+| `type` | enum | `"host"` (any), `"hostssl"` (TLS required), `"hostnossl"` (TLS disabled) |
+| `database` | string array | `["all"]`, `["sameuser"]`, or specific database names |
+| `user` | string array | `["all"]` or specific user names |
+| `address` | string | CIDR notation (e.g., `"0.0.0.0/0"`, `"10.0.0.0/8"`) |
+| `auth` | enum | `"trust"`, `"reject"`, `"password"`, `"scram-sha-256"`, `"cert"`, `"pam"`, `"ldap"` |
+
+If no rule matches, the connection is **rejected**.
+
+---
+
+### `[iam]` — IAM provider
+
+Controls how pgb-iam authenticates to PostgreSQL backends. When configured, pgb-iam generates short-lived IAM tokens instead of using static passwords.
+
+| Key | Type | Description |
+|---|---|---|
+| `provider` | enum | `"aws"`, `"gcp"`, or `"none"` |
+| `region` | string | AWS region (required for `"aws"`) |
+| `instance_host` | string | Database instance hostname (must match the IAM policy) |
+| `instance_port` | integer | Database port (default `5432`) |
+| `db_user` | string | IAM database user name |
+
+**AWS IAM**: Uses `GenerateDBAuthToken` via the AWS SDK. Credentials resolved at runtime: environment variables → `~/.aws/credentials` → `~/.aws/login/cache/*.json` (supports `aws login` extension).
+
+**GCP IAM**: Resolves tokens from `GCP_ACCESS_TOKEN` env var → GCP metadata server (`metadata.google.internal`). Requires the Cloud SQL Client IAM role on the service account.
+
+**Token caching**: Tokens are cached for 10 minutes with a background refresh task checking every 5 minutes.
+
+---
+
+### `[tls]` — TLS configuration
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Enable TLS for client connections |
+| `cert_path` | string | `"server.crt"` | Path to server certificate PEM |
+| `key_path` | string | `"server.key"` | Path to server private key PEM |
+| `connect_with_tls` | boolean | `false` | Connect to PostgreSQL with TLS |
+| `backend_ca_path` | string | none | Path to backend CA bundle PEM (e.g., RDS `global-bundle.pem`) |
+| `ciphers` | string array | none | Allowed TLS cipher suites (e.g., `["TLS13_AES_256_GCM_SHA384"]`) |
+| `min_protocol_version` | string | none | Minimum TLS version (e.g., `"TLSv1.2"`) |
+
+When `enabled = true`, clients must connect with TLS to port 6432. The optional `client_ca` in `[client_auth]` enables client certificate authentication.
+
+When `connect_with_tls = true`, all backend connections use TLS. Required for AWS RDS IAM auth.
+
+---
+
+### `[metrics]` — Prometheus metrics endpoint
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Enable metrics HTTP server |
+| `listen_addr` | string | `"127.0.0.1"` | Metrics bind address |
+| `listen_port` | integer | `9090` | Metrics HTTP port |
+
+**Exported metrics**: `pgb_iam_clients`, `pgb_iam_client_max`, `pgb_iam_server_active`, `pgb_iam_server_idle`, `pgb_iam_server_max`, `pgb_iam_server_reserve`, `pgb_iam_server_min`.
+
+```
+GET /metrics  → Prometheus text format
+GET /health   → "ok"
+```
+
+---
+
+### `[admin]` — Admin HTTP API
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Enable admin HTTP server |
+| `listen_addr` | string | `"127.0.0.1"` | Admin bind address |
+| `listen_port` | integer | `9091` | Admin HTTP port |
+
+```
+GET /stats   → JSON pool statistics (idle, active, max, reserve, min)
+GET /health  → JSON health status (healthy, last_error, last_check_ago_secs)
+```
+
+---
+
+### `[health_check]` — Backend health monitoring
+
+Periodically checks PostgreSQL reachability via TCP connect.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Enable periodic health checks |
+| `interval_secs` | integer | `30` | Seconds between checks |
+| `timeout_secs` | integer | `5` | TCP connect timeout in seconds |
+
+---
+
+### `[logging]` — Structured logging
+
+Controls output format and destination. Each output channel is independently configured.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `stderr` | enum | `"text"` | `"text"` or `"json"` — format for stderr |
+| `stdout` | enum | unset | `"text"` or `"json"` — enables stdout output (unset = disabled) |
+| `pipeline_path` | string | none | File path for pipeline log output |
+| `pipeline_format` | enum | `"json"` | `"text"` or `"json"` — format for pipeline file |
+
+**Examples:**
+
+```toml
+# Default: text to stderr only
+[logging]
+```
+
+```toml
+# Text on stderr + JSON on stdout (for log shippers)
+[logging]
+stdout = "json"
+```
+
+```toml
+# JSON to a file for pipeline ingestion
+[logging]
+stderr = "json"
+pipeline_path = "/var/log/pgb-iam/pipeline.json"
+pipeline_format = "json"
+```
+
+Each log event includes structured fields: `timestamp`, `level`, `component`, `action`, `hostname`, `message`, plus any additional fields specific to the event type (e.g., `clients`, `servers_active`, `db_user`, `db_name`).
 
 ## Authentication Methods
 

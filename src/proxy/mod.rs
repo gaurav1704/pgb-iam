@@ -6,7 +6,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tracing;
 
 use crate::auth::cache::TokenCache;
 
@@ -38,7 +37,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let addr = config.listen_addr();
     let listener = TcpListener::bind(&addr).await?;
-    tracing::info!("listening on {}", addr);
+    crate::log_event!(INFO, crate::log::PROXY, crate::log::START, "listening on {}", addr);
 
     loop {
         let (inbound, peer) = listener.accept().await?;
@@ -47,11 +46,11 @@ pub async fn run(
         let pool = pool.clone();
 
         tokio::spawn(async move {
-            tracing::debug!("new client connection from {}", peer);
+            crate::log_event!(DEBUG, crate::log::CLIENT, crate::log::CONNECT, "new client connection from {}", peer);
             if let Err(e) = handle_client(inbound, peer, &config, pool, token_cache.as_ref()).await {
-                tracing::error!("handler error for {}: {}", peer, e);
+                crate::log_event!(ERROR, crate::log::CLIENT, crate::log::ERROR, "handler error for {}: {}", peer, e);
             }
-            tracing::debug!("client {} disconnected", peer);
+            crate::log_event!(DEBUG, crate::log::CLIENT, crate::log::DISCONNECT, "client {} disconnected", peer);
         });
     }
 }
@@ -74,7 +73,7 @@ async fn handle_client(
 
     // Cancel requests come on their own plain connection; forward and close.
     if let pgproto::InitialMessage::Cancel(cancel) = &initial {
-        tracing::debug!("cancel request from {} (pid={} key={})", peer, cancel.pid, cancel.secret_key);
+        crate::log_event!(DEBUG, crate::log::CLIENT, crate::log::CANCEL, "cancel request from {} (pid={} key={})", peer, cancel.pid, cancel.secret_key);
         forward_cancel(config, cancel).await;
         return Ok(());
     }
@@ -130,9 +129,12 @@ async fn handle_client(
     };
     let client_cert_present = client_cert_was_present(&client);
 
-    tracing::info!(
+    crate::log_event!(
+        INFO, crate::log::CLIENT, crate::log::CONNECT,
+        db_user = &startup.user[..],
+        db_name = &startup.database[..],
         "client connecting as user={} db={}",
-        startup.user, startup.database
+        startup.user, startup.database,
     );
 
     // 3. Authenticate client locally
@@ -157,15 +159,23 @@ async fn handle_client(
     let client_count = pool.client_count.load(Ordering::Relaxed);
     let client_max = pool.client_max;
     if let Some(stats) = pool.stats_for(&pool_key).await {
-        tracing::info!(
-            "pool {}@{}: clients={}/{} servers={}/{} ready={}",
-            pool_key.db_user, pool_key.dbname,
-            client_count,
-            if client_max > 0 { client_max.to_string() } else { "–".to_string() },
-            stats.active,
-            stats.max + stats.reserve,
-            stats.idle,
-        );
+            crate::log_event!(
+                INFO, crate::log::POOL, crate::log::STATS,
+                clients = client_count,
+                client_max = client_max,
+                servers_active = stats.active,
+                servers_idle = stats.idle,
+                servers_max = stats.max + stats.reserve,
+                db_user = &pool_key.db_user[..],
+                db_name = &pool_key.dbname[..],
+                "pool {}@{}: clients={}/{} servers={}/{} ready={}",
+                pool_key.db_user, pool_key.dbname,
+                client_count,
+                if client_max > 0 { client_max.to_string() } else { "–".to_string() },
+                stats.active,
+                stats.max + stats.reserve,
+                stats.idle,
+            );
     }
     // 5. Acquire backend (waits for capacity, tries idle first).
     match config.pool.mode {
@@ -227,7 +237,7 @@ async fn acquire_session_backend(
 ) -> anyhow::Result<(ServerStream, std::time::Instant)> {
     match pool.acquire(pool_key).await {
         Some((backend, born_at)) => {
-            tracing::debug!("using idle backend from pool");
+            crate::log_event!(DEBUG, crate::log::POOL, crate::log::ACQUIRE, "using idle backend from pool");
             if let Err(e) = send_fake_ready(client).await {
                 pool.release(pool_key, backend, born_at).await;
                 return Err(e);
@@ -256,7 +266,7 @@ async fn acquire_and_release_initial(
 ) -> anyhow::Result<()> {
     match pool.acquire(pool_key).await {
         Some((backend, born_at)) => {
-            tracing::debug!("using idle backend from pool");
+            crate::log_event!(DEBUG, crate::log::POOL, crate::log::ACQUIRE, "using idle backend from pool");
             pool.release(pool_key, backend, born_at).await;
             Ok(())
         }
@@ -641,7 +651,7 @@ async fn create_backend(
                     let auth_req = pgproto::parse_auth_request(&payload)?;
                     match auth_req {
                         pgproto::AuthRequest::Ok => {
-                            tracing::info!("backend authentication succeeded");
+                            crate::log_event!(INFO, crate::log::AUTH, crate::log::AUTHENTICATE, "backend authentication succeeded");
                             break;
                         }
                         pgproto::AuthRequest::CleartextPassword
@@ -847,7 +857,7 @@ async fn transaction_loop(
 
         match event {
             Event::Timeout => {
-                tracing::warn!("timeout triggered for {}@{}, closing", pool_key.db_user, pool_key.dbname);
+                crate::log_event!(WARN, crate::log::CLIENT, crate::log::TIMEOUT, "timeout triggered for {}@{}, closing", pool_key.db_user, pool_key.dbname);
                 break;
             }
             Event::ClientMsg(None) => break,
@@ -864,7 +874,7 @@ async fn transaction_loop(
                     server = acquire_backend(pool, pool_key, config, token_cache).await;
                 }
                 if server.is_none() {
-                    tracing::error!("transaction_loop: failed to acquire backend");
+                    crate::log_event!(ERROR, crate::log::POOL, crate::log::ERROR, "transaction_loop: failed to acquire backend");
                     break;
                 }
 
@@ -984,13 +994,13 @@ async fn acquire_backend(
 ) -> Option<(ServerStream, std::time::Instant)> {
     match pool.acquire(pool_key).await {
         Some(s) => {
-            tracing::debug!("transaction_loop: acquired idle backend");
+            crate::log_event!(DEBUG, crate::log::POOL, crate::log::ACQUIRE, "transaction_loop: acquired idle backend");
             Some(s)
         }
         None => match create_backend(config, pool_key, token_cache).await {
             Ok(s) => Some(s),
             Err(e) => {
-                tracing::error!("transaction_loop: create_backend failed: {e}");
+                crate::log_event!(ERROR, crate::log::POOL, crate::log::ERROR, "transaction_loop: create_backend failed: {e}");
                 pool.cancel(pool_key).await;
                 None
             }
@@ -1011,11 +1021,11 @@ async fn run_reset_query(
     msg.extend_from_slice(&payload);
 
     if let Err(e) = server.write_all(&msg).await {
-        tracing::warn!("run_reset_query: write failed: {e}");
+        crate::log_event!(WARN, crate::log::POOL, crate::log::ERROR, "run_reset_query: write failed: {e}");
         return false;
     }
     if let Err(e) = server.flush().await {
-        tracing::warn!("run_reset_query: flush failed: {e}");
+        crate::log_event!(WARN, crate::log::POOL, crate::log::ERROR, "run_reset_query: flush failed: {e}");
         return false;
     }
 
@@ -1045,9 +1055,9 @@ async fn run_reset_query(
 
     if run_reset_query(&mut server, config).await {
         pool.release(pool_key, server, born_at).await;
-        tracing::debug!("released backend to pool");
+        crate::log_event!(DEBUG, crate::log::POOL, crate::log::RELEASE, "released backend to pool");
     } else {
-        tracing::warn!("dropping dead backend");
+        crate::log_event!(WARN, crate::log::POOL, crate::log::DROP, "dropping dead backend");
         pool.cancel(pool_key).await;
     }
 }
@@ -1064,7 +1074,7 @@ async fn spawn_warmup(
     if needed == 0 {
         return;
     }
-    tracing::info!("warming up pool ({} connections needed) for {}@{}", needed, pool_key.db_user, pool_key.dbname);
+    crate::log_event!(INFO, crate::log::POOL, crate::log::WARMUP, "warming up pool ({} connections needed) for {}@{}", needed, pool_key.db_user, pool_key.dbname);
 
     for _ in 0..needed {
         let pool = pool.clone();
@@ -1081,11 +1091,11 @@ async fn spawn_warmup(
                 None => match create_backend(&config, &key, token_cache.as_ref()).await {
                     Ok((stream, born_at)) => {
                         pool.release(&key, stream, born_at).await;
-                        tracing::debug!("warm-up connection created for {}@{}", key.db_user, key.dbname);
+                        crate::log_event!(DEBUG, crate::log::POOL, crate::log::CREATE, "warm-up connection created for {}@{}", key.db_user, key.dbname);
                     }
                     Err(e) => {
                         pool.cancel(&key).await;
-                        tracing::warn!("warm-up connection failed for {}@{}: {}", key.db_user, key.dbname, e);
+                        crate::log_event!(WARN, crate::log::POOL, crate::log::ERROR, "warm-up connection failed for {}@{}: {}", key.db_user, key.dbname, e);
                     }
                 },
             }

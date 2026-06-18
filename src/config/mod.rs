@@ -198,6 +198,41 @@ pub struct HealthCheckConfig {
     pub timeout_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+fn default_pipeline_format() -> LogFormat {
+    LogFormat::Json
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub stderr: LogFormat,
+    #[serde(default)]
+    pub stdout: Option<LogFormat>,
+    #[serde(default)]
+    pub pipeline_path: Option<String>,
+    #[serde(default = "default_pipeline_format")]
+    pub pipeline_format: LogFormat,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            stderr: LogFormat::Text,
+            stdout: None,
+            pipeline_path: None,
+            pipeline_format: LogFormat::Json,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub listen: ListenConfig,
@@ -208,6 +243,8 @@ pub struct Config {
     pub tls: Option<TlsConfig>,
     pub admin: Option<AdminConfig>,
     pub health_check: Option<HealthCheckConfig>,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 impl Config {

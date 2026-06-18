@@ -39,7 +39,7 @@ pub async fn generate_token(config: &IamConfig) -> anyhow::Result<String> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to generate auth token: {}", e))?;
 
-    tracing::info!("generated AWS RDS IAM token for {}@{}:{}", user, host, port);
+    crate::log_event!(INFO, crate::log::IAM, crate::log::REFRESH, "generated AWS RDS IAM token for {}@{}:{}", user, host, port);
     Ok(token.to_string())
 }
 

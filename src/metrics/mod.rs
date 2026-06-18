@@ -10,7 +10,7 @@ pub async fn serve(pool: Arc<PoolManager>, addr: &str) -> anyhow::Result<()> {
         .with_state(pool);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("metrics server listening on {}", addr);
+    crate::log_event!(INFO, crate::log::METRICS, crate::log::START, "metrics server listening on {}", addr);
     axum::serve(listener, app).await?;
     Ok(())
 }

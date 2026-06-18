@@ -24,7 +24,7 @@ pub async fn serve(
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("admin server listening on {}", addr);
+    crate::log_event!(INFO, crate::log::ADMIN, crate::log::START, "admin server listening on {}", addr);
     axum::serve(listener, app).await?;
     Ok(())
 }
