@@ -86,6 +86,8 @@ pub struct PoolConfig {
     pub database_limits: HashMap<String, PoolLimits>,
     #[serde(default)]
     pub user_limits: HashMap<String, PoolLimits>,
+    #[serde(default)]
+    pub client_max: u32,
 }
 
 fn default_reset_query() -> String {

@@ -2,12 +2,28 @@ pub mod admin;
 pub mod health;
 
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing;
 
 use crate::auth::cache::TokenCache;
+
+struct ClientTracker(Arc<crate::pool::PoolManager>);
+
+impl ClientTracker {
+    fn new(pool: Arc<crate::pool::PoolManager>) -> Self {
+        pool.client_count.fetch_add(1, Ordering::Relaxed);
+        Self(pool)
+    }
+}
+
+impl Drop for ClientTracker {
+    fn drop(&mut self) {
+        self.0.client_count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 use crate::config::{ClientAuthType, Config, IamProvider};
 use crate::pgproto;
 use crate::pool::{PoolKey, PoolManager, ServerStream};
@@ -51,6 +67,8 @@ async fn handle_client(
     pool: Arc<PoolManager>,
     token_cache: Option<&Arc<TokenCache>>,
 ) -> anyhow::Result<()> {
+    let _tracker = ClientTracker::new(pool.clone());
+
     // 0. Read initial message once — Cancel, SSLRequest, or Startup
     let mut initial = pgproto::read_initial_message(&mut raw_client).await?;
 
@@ -135,42 +153,32 @@ async fn handle_client(
         dbname: config.pool.dbname.clone(),
     };
 
-    // 5. Try idle pooled connection
-    if let Some((backend, born_at)) = pool.try_acquire_idle(&pool_key).await {
-        tracing::debug!("using idle backend from pool");
-        send_fake_ready(&mut client).await?;
-        match config.pool.mode {
-            crate::config::PoolMode::Session => {
-                relay_and_release(client, backend, &pool_key, &pool, config, born_at).await;
-            }
-            crate::config::PoolMode::Transaction => {
-                transaction_loop(client, Some((backend, born_at)), &pool_key, &pool, config, token_cache).await;
-            }
-        }
-        spawn_warmup(&pool, &pool_key, config, token_cache).await;
-        return Ok(());
+    // Log pool utilization
+    let client_count = pool.client_count.load(Ordering::Relaxed);
+    let client_max = pool.client_max;
+    if let Some(stats) = pool.stats_for(&pool_key).await {
+        tracing::info!(
+            "pool {}@{}: clients={}/{} servers={}/{} ready={}",
+            pool_key.db_user, pool_key.dbname,
+            client_count,
+            if client_max > 0 { client_max.to_string() } else { "–".to_string() },
+            stats.active,
+            stats.max + stats.reserve,
+            stats.idle,
+        );
     }
-
-    // 6. No idle — create new backend connection
-    if !pool.reserve(&pool_key).await {
-        anyhow::bail!("connection pool exhausted");
-    }
-    let (backend, born_at) = match create_backend(config, &pool_key, token_cache).await {
-        Ok(b) => b,
-        Err(e) => {
-            pool.cancel_reservation(&pool_key).await;
-            return Err(e);
-        }
-    };
-
-    send_fake_ready(&mut client).await?;
-
+    // 5. Acquire backend (waits for capacity, tries idle first).
     match config.pool.mode {
         crate::config::PoolMode::Session => {
+            let (backend, born_at) = acquire_session_backend(&pool, &pool_key, config, token_cache, &mut client).await?;
             relay_and_release(client, backend, &pool_key, &pool, config, born_at).await;
         }
         crate::config::PoolMode::Transaction => {
-            transaction_loop(client, Some((backend, born_at)), &pool_key, &pool, config, token_cache).await;
+            // Acquire + release backend BEFORE send_fake_ready so the slot
+            // is freed before any async writes reach the client network.
+            acquire_and_release_initial(&pool, &pool_key, config, token_cache).await?;
+            send_fake_ready(&mut client).await?;
+            transaction_loop(client, None, &pool_key, &pool, config, token_cache).await;
         }
     }
 
@@ -205,6 +213,58 @@ fn client_cert_was_present(client: &ClientStream) -> bool {
             session.peer_certificates().is_some_and(|c| !c.is_empty())
         }
         _ => false,
+    }
+}
+
+/// Acquire (or create) a backend and send fake ReadyForQuery to the client.
+/// Used in session mode where the backend is held for the full relay.
+async fn acquire_session_backend(
+    pool: &Arc<PoolManager>,
+    pool_key: &PoolKey,
+    config: &Config,
+    token_cache: Option<&Arc<TokenCache>>,
+    client: &mut ClientStream,
+) -> anyhow::Result<(ServerStream, std::time::Instant)> {
+    match pool.acquire(pool_key).await {
+        Some((backend, born_at)) => {
+            tracing::debug!("using idle backend from pool");
+            if let Err(e) = send_fake_ready(client).await {
+                pool.release(pool_key, backend, born_at).await;
+                return Err(e);
+            }
+            Ok((backend, born_at))
+        }
+        None => {
+            let (backend, born_at) = create_backend(config, pool_key, token_cache).await?;
+            if let Err(e) = send_fake_ready(client).await {
+                pool.cancel(pool_key).await;
+                return Err(e);
+            }
+            Ok((backend, born_at))
+        }
+    }
+}
+
+/// Acquire (or create) a backend and release it to the idle pool immediately.
+/// Transaction mode calls this before `send_fake_ready` so the backend slot
+/// is freed before any async writes to the client.
+async fn acquire_and_release_initial(
+    pool: &Arc<PoolManager>,
+    pool_key: &PoolKey,
+    config: &Config,
+    token_cache: Option<&Arc<TokenCache>>,
+) -> anyhow::Result<()> {
+    match pool.acquire(pool_key).await {
+        Some((backend, born_at)) => {
+            tracing::debug!("using idle backend from pool");
+            pool.release(pool_key, backend, born_at).await;
+            Ok(())
+        }
+        None => {
+            let (backend, born_at) = create_backend(config, pool_key, token_cache).await?;
+            pool.release(pool_key, backend, born_at).await;
+            Ok(())
+        }
     }
 }
 
@@ -728,31 +788,16 @@ async fn transaction_loop(
     let mut tx_start = std::time::Instant::now();
 
     loop {
-        if server.is_none() {
-            server = acquire_backend(pool, pool_key, config, token_cache).await;
-        }
-        if server.is_none() {
-            tracing::error!("transaction_loop: failed to acquire backend");
-            break;
-        }
-
-        let server_ref = server.as_mut().map(|(s, _b)| {
-            let ptr: *mut ServerStream = s;
-            ptr
-        }).unwrap();
-        let server_ref = unsafe { &mut *server_ref };
-
         enum Event {
             ClientMsg(Option<(u8, Vec<u8>)>),
             ServerMsg(Option<(u8, Vec<u8>)>),
             Timeout,
         }
 
-        // Build select with timeouts — do in a block to drop futures after select
-        let event = {
+        // Only read from the server when one is assigned.
+        let event = if let Some((ref mut s, _)) = server {
             let client_fut = pgproto::read_pg_message(&mut client);
-            let server_fut = pgproto::read_pg_message(server_ref);
-
+            let server_fut = pgproto::read_pg_message(s);
             let client_idle = if config.pool.client_idle_timeout_secs > 0 {
                 std::time::Duration::from_secs(config.pool.client_idle_timeout_secs)
             } else {
@@ -786,6 +831,18 @@ async fn transaction_loop(
                     _ = tokio::time::sleep(query_wait) => Event::Timeout,
                 }
             }
+        } else {
+            // No server assigned — only wait for client input.
+            let client_fut = pgproto::read_pg_message(&mut client);
+            let client_idle = if config.pool.client_idle_timeout_secs > 0 {
+                std::time::Duration::from_secs(config.pool.client_idle_timeout_secs)
+            } else {
+                std::time::Duration::MAX
+            };
+            tokio::select! {
+                msg = client_fut => Event::ClientMsg(msg.ok().flatten()),
+                _ = tokio::time::sleep(client_idle) => Event::Timeout,
+            }
         };
 
         match event {
@@ -802,6 +859,15 @@ async fn transaction_loop(
                 break;
             }
             Event::ClientMsg(Some((t, p))) => {
+                // Acquire a backend on demand — don't hold one while idle.
+                if server.is_none() {
+                    server = acquire_backend(pool, pool_key, config, token_cache).await;
+                }
+                if server.is_none() {
+                    tracing::error!("transaction_loop: failed to acquire backend");
+                    break;
+                }
+
                 // Track extended query messages
                 match t {
                     pgproto::ext::PARSE => {
@@ -890,10 +956,9 @@ async fn transaction_loop(
                                     pool.release(pool_key, released, born).await;
                                 }
                             } else {
-                                let _ = server.take();
+                                server.take();
+                                pool.cancel(pool_key).await;
                             }
-                        } else {
-                            let _ = server.take();
                         }
                     }
                     _ => {}
@@ -905,6 +970,8 @@ async fn transaction_loop(
     if let Some((mut s, born)) = server.take() {
         if run_reset_query(&mut s, config).await {
             pool.release(pool_key, s, born).await;
+        } else {
+            pool.cancel(pool_key).await;
         }
     }
 }
@@ -915,23 +982,19 @@ async fn acquire_backend(
     config: &Config,
     token_cache: Option<&Arc<TokenCache>>,
 ) -> Option<(ServerStream, std::time::Instant)> {
-    if let Some(s) = pool.try_acquire_idle(pool_key).await {
-        tracing::debug!("transaction_loop: acquired idle backend");
-        return Some(s);
-    }
-
-    if !pool.reserve(pool_key).await {
-        tracing::warn!("transaction_loop: pool exhausted");
-        return None;
-    }
-
-    match create_backend(config, pool_key, token_cache).await {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::error!("transaction_loop: create_backend failed: {e}");
-            pool.cancel_reservation(pool_key).await;
-            None
+    match pool.acquire(pool_key).await {
+        Some(s) => {
+            tracing::debug!("transaction_loop: acquired idle backend");
+            Some(s)
         }
+        None => match create_backend(config, pool_key, token_cache).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!("transaction_loop: create_backend failed: {e}");
+                pool.cancel(pool_key).await;
+                None
+            }
+        },
     }
 }
 
@@ -985,6 +1048,7 @@ async fn run_reset_query(
         tracing::debug!("released backend to pool");
     } else {
         tracing::warn!("dropping dead backend");
+        pool.cancel(pool_key).await;
     }
 }
 
@@ -1009,18 +1073,21 @@ async fn spawn_warmup(
         let token_cache = token_cache.cloned();
 
         tokio::spawn(async move {
-            if !pool.reserve(&key).await {
-                return;
-            }
-            match create_backend(&config, &key, token_cache.as_ref()).await {
-                Ok((stream, born_at)) => {
+            match pool.acquire(&key).await {
+                Some((stream, born_at)) => {
+                    // Got idle — already warm enough, just put it back
                     pool.release(&key, stream, born_at).await;
-                    tracing::debug!("warm-up connection created for {}@{}", key.db_user, key.dbname);
                 }
-                Err(e) => {
-                    pool.cancel_reservation(&key).await;
-                    tracing::warn!("warm-up connection failed for {}@{}: {}", key.db_user, key.dbname, e);
-                }
+                None => match create_backend(&config, &key, token_cache.as_ref()).await {
+                    Ok((stream, born_at)) => {
+                        pool.release(&key, stream, born_at).await;
+                        tracing::debug!("warm-up connection created for {}@{}", key.db_user, key.dbname);
+                    }
+                    Err(e) => {
+                        pool.cancel(&key).await;
+                        tracing::warn!("warm-up connection failed for {}@{}: {}", key.db_user, key.dbname, e);
+                    }
+                },
             }
         });
     }

@@ -1,9 +1,11 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tracing;
+use tokio::sync::Semaphore;
 
 use crate::config;
 
@@ -60,7 +62,6 @@ impl AsyncWrite for ServerStream {
 }
 
 impl ServerStream {
-    /// Returns peer certificates if this is a TLS connection.
     #[allow(dead_code)]
     pub fn peer_certificates(&self) -> Option<Vec<rustls::pki_types::CertificateDer<'static>>> {
         match self {
@@ -82,8 +83,6 @@ pub struct PoolKey {
     pub dbname: String,
 }
 
-// ── Per-pool limits ─────────────────────────────────────────────────
-
 #[derive(Clone, Debug)]
 pub struct PoolLimits {
     pub max_size: usize,
@@ -98,8 +97,6 @@ pub enum PoolStrategy {
     Fifo,
 }
 
-// ── Per-pool state ──────────────────────────────────────────────────
-
 struct IdleConn {
     stream: ServerStream,
     parked_since: Instant,
@@ -108,37 +105,23 @@ struct IdleConn {
 
 struct PoolInner {
     idle: VecDeque<IdleConn>,
-    active: usize,
     limits: PoolLimits,
     idle_timeout: Duration,
     server_lifetime: Duration,
-}
-
-impl PoolInner {
-    fn can_create(&self) -> bool {
-        let hard_limit = self.limits.max_size + self.limits.reserve_size;
-        self.active + self.idle.len() < hard_limit
-    }
-
-    fn needs_warmup(&self) -> usize {
-        let currently = self.idle.len() + self.active;
-        if self.limits.min_size > currently {
-            self.limits.min_size - currently
-        } else {
-            0
-        }
-    }
 }
 
 // ── PoolManager ─────────────────────────────────────────────────────
 
 pub struct PoolManager {
     pools: Mutex<HashMap<PoolKey, PoolInner>>,
+    semaphores: tokio::sync::RwLock<HashMap<PoolKey, Arc<Semaphore>>>,
     global_limits: PoolLimits,
     default_timeout: Duration,
     default_lifetime: Duration,
     database_limits: HashMap<String, PoolLimits>,
     user_limits: HashMap<String, PoolLimits>,
+    pub client_max: usize,
+    pub client_count: AtomicUsize,
 }
 
 impl PoolManager {
@@ -187,132 +170,18 @@ impl PoolManager {
 
         Self {
             pools: Mutex::new(HashMap::new()),
+            semaphores: tokio::sync::RwLock::new(HashMap::new()),
             global_limits,
             default_timeout: Duration::from_secs(config.idle_timeout_secs),
             default_lifetime: Duration::from_secs(config.server_lifetime_secs),
             database_limits,
             user_limits,
+            client_max: config.client_max as usize,
+            client_count: AtomicUsize::new(0),
         }
-    }
-
-    /// Try to acquire an idle connection. Returns (stream, born_at).
-    pub async fn try_acquire_idle(&self, key: &PoolKey) -> Option<(ServerStream, Instant)> {
-        let mut pools = self.pools.lock().await;
-        let entry = pools.get_mut(key)?;
-        let c = loop {
-            match match entry.limits.strategy {
-                PoolStrategy::Lifo => entry.idle.pop_back(),
-                PoolStrategy::Fifo => entry.idle.pop_front(),
-            } {
-                Some(c) => {
-                    let expired = c.parked_since.elapsed() >= entry.idle_timeout
-                        || c.born_at.elapsed() >= entry.server_lifetime;
-                    if !expired {
-                        entry.active += 1;
-                        break Some(c);
-                    }
-                }
-                None => break None,
-            }
-        };
-        c.map(|c| (c.stream, c.born_at))
-    }
-
-    /// Reserve capacity (increments active count). Returns false if full.
-    pub async fn reserve(&self, key: &PoolKey) -> bool {
-        let mut pools = self.pools.lock().await;
-        let entry = self.entry_or_create(&mut *pools, key);
-        if !entry.can_create() {
-            return false;
-        }
-        entry.active += 1;
-        true
-    }
-
-    /// Release a connection back to the pool.
-    pub async fn release(&self, key: &PoolKey, stream: ServerStream, born_at: Instant) {
-        let mut pools = self.pools.lock().await;
-        let entry = self.entry_or_create(&mut *pools, key);
-        let expired = born_at.elapsed() >= entry.server_lifetime;
-        if !expired && entry.idle.len() < entry.limits.max_size {
-            entry.idle.push_back(IdleConn {
-                stream,
-                parked_since: Instant::now(),
-                born_at,
-            });
-        }
-        entry.active = entry.active.saturating_sub(1);
-    }
-
-    /// Cancel a reservation.
-    pub async fn cancel_reservation(&self, key: &PoolKey) {
-        let mut pools = self.pools.lock().await;
-        if let Some(entry) = pools.get_mut(key) {
-            entry.active = entry.active.saturating_sub(1);
-        }
-    }
-
-    /// How many warm-up connections this pool needs.
-    pub async fn needs_warmup(&self, key: &PoolKey) -> usize {
-        let pools = self.pools.lock().await;
-        pools.get(key).map(|e| e.needs_warmup()).unwrap_or(0)
-    }
-
-    // ── Stats ────────────────────────────────────────────────────────
-
-    #[allow(dead_code)]
-    pub async fn stats_for(&self, key: &PoolKey) -> Option<PoolStats> {
-        let pools = self.pools.lock().await;
-        pools.get(key).map(|e| PoolStats {
-            idle: e.idle.len(),
-            active: e.active,
-            max: e.limits.max_size,
-            reserve: e.limits.reserve_size,
-            min: e.limits.min_size,
-        })
-    }
-
-    #[allow(dead_code)]
-    pub async fn all_stats(&self) -> HashMap<PoolKey, PoolStats> {
-        let pools = self.pools.lock().await;
-        pools
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    PoolStats {
-                        idle: v.idle.len(),
-                        active: v.active,
-                        max: v.limits.max_size,
-                        reserve: v.limits.reserve_size,
-                        min: v.limits.min_size,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    pub async fn global_stats(&self) -> PoolStats {
-        let pools = self.pools.lock().await;
-        let mut total = PoolStats {
-            idle: 0,
-            active: 0,
-            max: 0,
-            reserve: 0,
-            min: 0,
-        };
-        for entry in pools.values() {
-            total.idle += entry.idle.len();
-            total.active += entry.active;
-            total.max += entry.limits.max_size;
-            total.reserve += entry.limits.reserve_size;
-            total.min += entry.limits.min_size;
-        }
-        total
     }
 
     fn resolve_limits(&self, key: &PoolKey) -> PoolLimits {
-        // Per-user limit takes precedence over per-database, which overrides global
         if let Some(limits) = self.user_limits.get(&key.db_user) {
             return limits.clone();
         }
@@ -322,32 +191,178 @@ impl PoolManager {
         self.global_limits.clone()
     }
 
-    fn entry_or_create<'a>(
-        &self,
-        pools: &'a mut HashMap<PoolKey, PoolInner>,
-        key: &PoolKey,
-    ) -> &'a mut PoolInner {
+    fn capacity(&self, key: &PoolKey) -> usize {
         let limits = self.resolve_limits(key);
-        let timeout = self.default_timeout;
-        let lifetime = self.default_lifetime;
-        pools.entry(key.clone()).or_insert_with(|| {
-            tracing::info!(
-                "creating pool for {}@{} (max={}, min={}, reserve={}, strategy={:?})",
-                key.db_user,
-                key.dbname,
-                limits.max_size,
-                limits.min_size,
-                limits.reserve_size,
-                limits.strategy,
-            );
-            PoolInner {
-                idle: VecDeque::new(),
-                active: 0,
-                limits,
-                idle_timeout: timeout,
-                server_lifetime: lifetime,
+        limits.max_size + limits.reserve_size
+    }
+
+    async fn get_or_create_semaphore(&self, key: &PoolKey) -> Arc<Semaphore> {
+        {
+            let read = self.semaphores.read().await;
+            if let Some(s) = read.get(key) {
+                return s.clone();
             }
+        }
+        let mut write = self.semaphores.write().await;
+        write
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.capacity(key))))
+            .clone()
+    }
+
+    /// Acquire a backend connection slot — waits until one is available.
+    /// Returns an idle connection if one exists, otherwise signals the
+    /// caller to create a new backend via `create_backend`.
+    ///
+    /// On return, exactly one permit is consumed from the semaphore
+    /// (either carried by the idle connection or held for a new backend).
+    pub async fn acquire(
+        &self,
+        key: &PoolKey,
+    ) -> Option<(ServerStream, Instant)> {
+        let sem = self.get_or_create_semaphore(key).await;
+
+        // 1. Check for an idle connection first — no extra permit needed
+        //    because the idle connection already holds one.
+        {
+            let mut pools = self.pools.lock().await;
+            if let Some(inner) = pools.get_mut(key) {
+                loop {
+                    match match inner.limits.strategy {
+                        PoolStrategy::Lifo => inner.idle.pop_back(),
+                        PoolStrategy::Fifo => inner.idle.pop_front(),
+                    } {
+                        Some(ic) => {
+                            let expired = ic.parked_since.elapsed() >= inner.idle_timeout
+                                || ic.born_at.elapsed() >= inner.server_lifetime;
+                            if !expired {
+                                return Some((ic.stream, ic.born_at));
+                            }
+                            // Expired — drop the connection, return its permit.
+                            drop(ic);
+                            sem.add_permits(1);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        // 2. No idle — acquire a permit for a new backend, then let the
+        //    caller create one.  `forget()` prevents auto-return on drop.
+        let permit = sem.acquire().await.ok()?;
+        permit.forget();
+        None
+    }
+
+    /// Release a connection back to the pool (returns the semaphore permit).
+    pub async fn release(&self, key: &PoolKey, stream: ServerStream, born_at: Instant) {
+        let limits = self.resolve_limits(key);
+        let expired = born_at.elapsed() >= self.default_lifetime;
+        if !expired {
+            let mut pools = self.pools.lock().await;
+            let inner = pools.entry(key.clone()).or_insert_with(|| PoolInner {
+                idle: VecDeque::new(),
+                limits: limits.clone(),
+                idle_timeout: self.default_timeout,
+                server_lifetime: self.default_lifetime,
+            });
+            if inner.idle.len() < inner.limits.max_size {
+                inner.idle.push_back(IdleConn {
+                    stream,
+                    parked_since: Instant::now(),
+                    born_at,
+                });
+                // Permit stays with the idle connection
+                return;
+            }
+        }
+        // Drop the connection and release the permit
+        drop(stream);
+        let sem = self.get_or_create_semaphore(key).await;
+        sem.add_permits(1);
+    }
+
+    /// Cancel an in-progress backend creation (returns the semaphore permit).
+    pub async fn cancel(&self, key: &PoolKey) {
+        let sem = self.get_or_create_semaphore(key).await;
+        sem.add_permits(1);
+    }
+
+    /// How many warm-up connections this pool needs.
+    pub async fn needs_warmup(&self, key: &PoolKey) -> usize {
+        let limits = self.resolve_limits(key);
+        let pools = self.pools.lock().await;
+        if let Some(inner) = pools.get(key) {
+            let currently = inner.idle.len();
+            if limits.min_size > currently {
+                limits.min_size - currently
+            } else {
+                0
+            }
+        } else {
+            limits.min_size
+        }
+    }
+
+    // ── Stats ────────────────────────────────────────────────────────
+
+    pub async fn stats_for(&self, key: &PoolKey) -> Option<PoolStats> {
+        let limits = self.resolve_limits(key);
+        let sem = self.get_or_create_semaphore(key).await;
+        let available = sem.available_permits();
+        let total = limits.max_size + limits.reserve_size;
+        let pools = self.pools.lock().await;
+        let idle = pools.get(key).map(|p| p.idle.len()).unwrap_or(0);
+        Some(PoolStats {
+            idle,
+            active: total - available - idle,
+            max: limits.max_size,
+            reserve: limits.reserve_size,
+            min: limits.min_size,
         })
+    }
+
+    #[allow(dead_code)]
+    pub async fn all_stats(&self) -> HashMap<PoolKey, PoolStats> {
+        let pools = self.pools.lock().await;
+        let mut result = HashMap::new();
+        for (key, inner) in pools.iter() {
+            result.insert(
+                key.clone(),
+                PoolStats {
+                    idle: inner.idle.len(),
+                    active: 0,
+                    max: inner.limits.max_size,
+                    reserve: inner.limits.reserve_size,
+                    min: inner.limits.min_size,
+                },
+            );
+        }
+        result
+    }
+
+    pub async fn global_stats(&self) -> PoolStats {
+        let sems = self.semaphores.read().await;
+        let pools = self.pools.lock().await;
+        let mut total = PoolStats {
+            idle: 0,
+            active: 0,
+            max: 0,
+            reserve: 0,
+            min: 0,
+        };
+        for (key, inner) in pools.iter() {
+            total.idle += inner.idle.len();
+            total.max += inner.limits.max_size;
+            total.reserve += inner.limits.reserve_size;
+            total.min += inner.limits.min_size;
+            let cap = inner.limits.max_size + inner.limits.reserve_size;
+            let available = sems.get(key).map(|s| s.available_permits() as usize).unwrap_or(cap);
+            let consumed = cap.saturating_sub(available);
+            total.active += consumed.saturating_sub(inner.idle.len());
+        }
+        total
     }
 }
 
