@@ -19,25 +19,32 @@ This is fragile, operationally expensive, and undermines the security benefits o
 
 ### Core Design
 
-```
-┌──────────┐     ┌──────────┐     ┌──────────┐
-│  Client   │ ──▶ │  pgb-iam  │ ──▶ │ Postgres  │
-│  (psql)   │ ◀── │  :6432   │ ◀── │  :5432   │
-└──────────┘     └──────────┘     └──────────┘
-                      │
-                      ▼
-              ┌──────────────┐
-              │ IAM Provider  │
-              │ (AWS/GCP)     │
-              └──────────────┘
+```mermaid
+flowchart LR
+    C["Client<br/>(psql)"] <-->|":6432"| P["pgb-iam"]
+    P <-->|":5432"| PG[("PostgreSQL<br/>(RDS / Cloud SQL)")]
+
+    I[("IAM Provider<br/>(AWS / GCP)")] -.->|"token"| P
+
+    style C fill:#1a1a2e,stroke:#e94560,color:#fff
+    style P fill:#16213e,stroke:#0f3460,color:#fff
+    style PG fill:#1a1a2e,stroke:#00b4d8,color:#fff
+    style I fill:#1a1a2e,stroke:#e9c46a,color:#fff
 ```
 
 ### Two-Level Authentication
 
-```
-Client ──[trust|password|SCRAM|cert|PAM|LDAP|HBA]──▶ pgb-iam ──[IAM token|SCRAM|MD5|cleartext]──▶ PostgreSQL
-                                                       │
-                                                       └── PoolManager ── holds ServerStreams
+```mermaid
+flowchart LR
+    CL["Client"] -->|"trust / password / scram / cert /<br/>PAM / LDAP / HBA / auth_query"| PO["pgb-iam"]
+    PO -->|"IAM token (cleartext / MD5 / SCRAM)"| PG["PostgreSQL"]
+
+    PO --> PM["PoolManager<br/>holds ServerStreams<br/>keyed by (host,port,db,user)"]
+
+    style CL fill:#1a1a2e,stroke:#e94560,color:#fff
+    style PO fill:#16213e,stroke:#0f3460,color:#fff
+    style PG fill:#1a1a2e,stroke:#00b4d8,color:#fff
+    style PM fill:#16213e,stroke:#e9c46a,color:#fff
 ```
 
 1. **Client connection**: Authenticates to pgb-iam locally via any of 8 methods: `trust`, `password` (cleartext), `scram-sha-256` (SASL), `cert` (TLS client certificate), `PAM`, `LDAP`, `hba` (pg_hba.conf-style rules), or `auth_query` (dynamic DB lookup)
@@ -159,6 +166,76 @@ cp config.toml config.toml
 
 # Metrics
 curl http://127.0.0.1:9090/metrics
+```
+
+## Pool Lifecycle
+
+```mermaid
+flowchart TD
+    A["Client connects<br/>psql -h :6432"] --> B["Parse Startup / SSLRequest / Cancel"]
+
+    B --> C{"Message type?"}
+    C -->|Cancel| D["Forward cancel<br/>to backend"]
+    D --> E["Done"]
+    C -->|SSLRequest| F["TLS upgrade<br/>rustls accept"]
+    F --> G["Re-read Startup"]
+    G --> H
+    C -->|Startup| H["Extract (user, db, params)"]
+
+    H --> I["Authenticate client<br/>trust | password | scram | cert<br/>PAM | LDAP | HBA | auth_query"]
+
+    I --> J["PoolManager.acquire(key)"]
+
+    J --> K{"Idle connection<br/>in pool?"}
+    K -->|Yes| L["Pop from idle pool<br/>(LIFO / FIFO)"]
+    K -->|No| M["sem.acquire()<br/>wait for permit"]
+
+    M --> N["create_backend()<br/>TCP → TLS → Startup → Auth<br/>IAM token (cleartext/MD5/SCRAM)"]
+    N --> O["Return new backend<br/>to caller"]
+
+    L --> P["Return idle backend<br/>to caller"]
+    O --> P
+
+    P --> Q{"Pool mode?"}
+
+    Q -->|Transaction| R["Release backend to idle<br/>IMMEDIATELY (before any I/O)"]
+    R --> S["send_fake_ready()"]
+    S --> T["transaction_loop()"]
+
+    T --> U["Wait for client msg<br/>(no server assigned)"]
+    U --> V["Client sends query"]
+    V --> W["acquire_backend()<br/>pool.acquire → idle or new"]
+    W --> X["Forward query to server"]
+    X --> Y["Forward response to client"]
+    Y --> Z{"ReadyForQuery('I')?"}
+    Z -->|Yes| AA["run_reset_query()<br/>pool.release() → idle"]
+    AA --> U
+    Z -->|No| T
+
+    Q -->|Session| AB["send_fake_ready()"]
+    AB --> AC["relay_and_release()<br/>copy_bidirectional<br/>(holds backend for session)"]
+    AC --> AD["run_reset_query()"]
+    AD -->|success| AE["pool.release()"]
+    AD -->|failure| AF["pool.cancel()"]
+
+    T -->|client disconnect| AG["Cleanup"]
+    AC -->|client disconnect| AG
+
+    AG --> AH["PoolManager.release(stream, born_at)"]
+
+    AH --> AI{"born_at expired<br/>(server_lifetime)?"}
+    AI -->|Yes| AJ["Drop connection<br/>sem.add_permits(1)"]
+    AI -->|No| AK{"idle pool<br/>under max_size?"}
+    AK -->|Yes| AL["Push to idle pool<br/>permit stays consumed"]
+    AK -->|No| AM["Drop connection<br/>sem.add_permits(1)"]
+
+    AL --> AN["spawn_warmup()<br/>if idle < min_size<br/>→ create backends"]
+
+    style A fill:#1a1a2e,stroke:#e94560,color:#fff
+    style I fill:#1a1a2e,stroke:#e94560,color:#fff
+    style J fill:#1a1a2e,stroke:#e94560,color:#fff
+    style Q fill:#1a1a2e,stroke:#e94560,color:#fff
+    style AH fill:#1a1a2e,stroke:#e94560,color:#fff
 ```
 
 ## Architecture
