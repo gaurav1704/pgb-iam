@@ -9,7 +9,7 @@ homepage = "https://github.com/gaurav1704/pgb-iam"
 readme = "README.md"
 exclude = ["config.toml"]
 keywords = ["postgresql", "connection-pooler", "iam", "aws-rds", "gcp-cloud-sql"]
-categories = ["database::postgresql", "network::tcp"]
+categories = ["database", "authentication", "network-programming"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
