@@ -2,6 +2,14 @@
 name = "pgb-iam"
 version = "0.1.0"
 edition = "2021"
+description = "IAM-Aware PostgreSQL Connection Pooler — production-ready PgBouncer alternative with native AWS RDS IAM and GCP Cloud SQL IAM authentication"
+license = "Apache-2.0"
+repository = "https://github.com/gaurav1704/pgb-iam"
+homepage = "https://github.com/gaurav1704/pgb-iam"
+readme = "README.md"
+exclude = ["config.toml"]
+keywords = ["postgresql", "connection-pooler", "iam", "aws-rds", "gcp-cloud-sql"]
+categories = ["database::postgresql", "network::tcp"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
