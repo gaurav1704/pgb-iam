@@ -1,5 +1,9 @@
 # pgb-iam — IAM-Aware PostgreSQL Connection Pooler
 
+[![Crates.io](https://img.shields.io/crates/v/pgb-iam)](https://crates.io/crates/pgb-iam)
+[![docs.rs](https://img.shields.io/docsrs/pgb-iam)](https://docs.rs/pgb-iam)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE-APACHE)
+
 ## Index
 
 <ol>

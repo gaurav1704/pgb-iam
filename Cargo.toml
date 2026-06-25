@@ -11,6 +11,10 @@ exclude = ["config.toml"]
 keywords = ["postgresql", "connection-pooler", "iam", "aws-rds", "gcp-cloud-sql"]
 categories = ["database", "authentication", "network-programming"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
